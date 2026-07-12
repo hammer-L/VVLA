@@ -30,9 +30,34 @@ Run at least seeds 0, 1, and 2. Change `--horizon 1` for the single-action ablat
 `--backbone siglip` for the frozen-backbone ablation.
 
 ```bash
-python scripts/va_prior_experiment.py train --dataset /data/libero_goal/*_demo.hdf5 --output runs/va/deterministic_s0 --head deterministic --backbone dinov2 --seed 0
-python scripts/va_prior_experiment.py train --dataset /data/libero_goal/*_demo.hdf5 --output runs/va/gmm_s0 --head gmm --backbone dinov2 --seed 0
-python scripts/va_prior_experiment.py train --dataset /data/libero_goal/*_demo.hdf5 --output runs/va/flow_s0 --head flow --backbone dinov2 --seed 0
+export CUDA_VISIBLE_DEVICES=1
+
+DATASETS=(
+  /root/gpufree-data/liumingyu/starVLA/playground/Datasets/LEROBOT_LIBERO_DATA/datasets/libero_goal/*_demo.hdf5
+)
+
+echo "找到 ${#DATASETS[@]} 个任务文件"
+printf '%s\n' "${DATASETS[@]}"
+
+for seed in 0 1 2; do
+  python scripts/va_prior_experiment.py train \
+    --dataset "${DATASETS[@]}" \
+    --output "runs/va/deterministic_multitask_s${seed}" \
+    --head deterministic \
+    --backbone dinov2 \
+    --seed "$seed" 
+done
+
+
+# Flow
+for seed in 0 1 2; do
+  python scripts/va_prior_experiment.py train \
+    --dataset "${DATASETS[@]}" \
+    --output "runs/va/flow_s${seed}" \
+    --head flow \
+    --backbone dinov2 \
+    --seed "$seed"
+done
 ```
 
 `--backbone tiny` is an offline smoke-test option; it is not an experimental result.
@@ -41,6 +66,7 @@ python scripts/va_prior_experiment.py train --dataset /data/libero_goal/*_demo.h
 
 ```bash
 python scripts/va_prior_experiment.py evaluate --checkpoint runs/va/flow_s0/best.pt --output runs/va/flow_s0/test
+
 python scripts/va_prior_experiment.py rollout --checkpoint runs/va/flow_s0/best.pt --bddl-file /data/libero/bddl_files/libero_goal/open_the_top_drawer_and_put_the_bowl_inside.bddl --init-states /data/libero/init_files/libero_goal/open_the_top_drawer_and_put_the_bowl_inside.pruned_init --output runs/va/flow_s0/rollout
 ```
 
@@ -75,3 +101,4 @@ python scripts/summarize_va_prior.py \
   --flow runs/va/flow_s{0,1,2}/test/metrics.json \
   --output runs/va/summary.json
 ```
+

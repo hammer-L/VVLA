@@ -290,6 +290,7 @@ def parser():
     common.add_argument("--workers", type=int, default=4)
     t = sub.add_parser("train", parents=[common]); t.add_argument("--dataset", nargs="+", required=True,
         help="One or more same-scene goal HDF5 files; no goal id is passed to the model")
+    t.add_argument("--output", required=True)
     t.add_argument("--head", choices=["deterministic", "gmm", "flow"], required=True)
     t.add_argument("--backbone", choices=["tiny", "dinov2", "siglip"], default="dinov2")
     t.add_argument("--horizon", type=int, default=10); t.add_argument("--hidden-dim", type=int, default=256)
