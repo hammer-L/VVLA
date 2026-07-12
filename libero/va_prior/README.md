@@ -1,7 +1,7 @@
 # Vision-action action-prior experiment
 
-This module tests whether a language-free, single-task visual policy can produce a useful
-multi-modal action-chunk prior on LIBERO_GOAL. It deliberately lives outside the lifelong
+This module tests whether a language-free visual policy trained on multiple goals in the same
+scene can produce a useful multi-modal action-chunk prior on LIBERO_GOAL. It lives outside the lifelong
 training stack so that trajectory splits and baseline comparisons are explicit.
 
 ## Setup and data
@@ -17,9 +17,9 @@ pip install -r requirements-va.txt
 Install the CUDA-enabled PyTorch build appropriate for the server first; like the upstream
 LIBERO requirements, `requirements-va.txt` intentionally does not select a CUDA build.
 
-The expected dataset is
-`libero_goal/open_the_top_drawer_and_put_the_bowl_inside_demo.hdf5`. The script checks the
-actual action and proprioception dimensions from HDF5. Splits are made by demonstration,
+Pass multiple `libero_goal/*_demo.hdf5` files from the shared tabletop scene. The model is
+never given their task ids or language; task ids are retained only for grouped metrics. The
+script checks the actual action and proprioception dimensions from HDF5. Splits are made by demonstration,
 saved in every run directory, and shared by setting the same `--split-seed`. The default
 observation history is two frames (`--obs-horizon 2`); this is distinct from the ten-step
 future action horizon.
@@ -30,9 +30,9 @@ Run at least seeds 0, 1, and 2. Change `--horizon 1` for the single-action ablat
 `--backbone siglip` for the frozen-backbone ablation.
 
 ```bash
-python scripts/va_prior_experiment.py train --dataset /data/libero_goal/open_the_top_drawer_and_put_the_bowl_inside_demo.hdf5 --output runs/va/deterministic_s0 --head deterministic --backbone dinov2 --seed 0
-python scripts/va_prior_experiment.py train --dataset /data/libero_goal/open_the_top_drawer_and_put_the_bowl_inside_demo.hdf5 --output runs/va/gmm_s0 --head gmm --backbone dinov2 --seed 0
-python scripts/va_prior_experiment.py train --dataset /data/libero_goal/open_the_top_drawer_and_put_the_bowl_inside_demo.hdf5 --output runs/va/flow_s0 --head flow --backbone dinov2 --seed 0
+python scripts/va_prior_experiment.py train --dataset /data/libero_goal/*_demo.hdf5 --output runs/va/deterministic_s0 --head deterministic --backbone dinov2 --seed 0
+python scripts/va_prior_experiment.py train --dataset /data/libero_goal/*_demo.hdf5 --output runs/va/gmm_s0 --head gmm --backbone dinov2 --seed 0
+python scripts/va_prior_experiment.py train --dataset /data/libero_goal/*_demo.hdf5 --output runs/va/flow_s0 --head flow --backbone dinov2 --seed 0
 ```
 
 `--backbone tiny` is an offline smoke-test option; it is not an experimental result.
@@ -44,7 +44,12 @@ python scripts/va_prior_experiment.py evaluate --checkpoint runs/va/flow_s0/best
 python scripts/va_prior_experiment.py rollout --checkpoint runs/va/flow_s0/best.pt --bddl-file /data/libero/bddl_files/libero_goal/open_the_top_drawer_and_put_the_bowl_inside.bddl --init-states /data/libero/init_files/libero_goal/open_the_top_drawer_and_put_the_bowl_inside.pruned_init --output runs/va/flow_s0/rollout
 ```
 
-Offline evaluation writes `metrics.json` and `candidate_pca.png`. Closed-loop evaluation
+Offline evaluation writes `metrics.json` and `candidate_pca.png`. In addition to per-goal
+metrics, `cross_goal_initial_coverage` uses matched held-out demonstration indices: candidates
+from one language-free initial observation are compared with initial action chunks from every
+goal. Index-aligned recordings are accepted only when image MAE and proprioception RMSE are
+below configurable matching thresholds, so different physical states are not mislabeled as
+goal ambiguity. This is the main test of the intended multi-goal prior. Closed-loop evaluation
 uses 10 init states, 20 stochastic repeats each, samples from `prior_weights`, executes two
 actions, and replans. Collision rate is `null` when the environment does not expose a
 collision field; it is never silently reported as zero.

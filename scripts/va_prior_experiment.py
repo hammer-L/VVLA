@@ -1,4 +1,4 @@
-"""Train and evaluate the single-task LIBERO vision-action prior experiment."""
+"""Train and evaluate a language-free, same-scene multi-goal action prior."""
 import argparse
 import json
 import random
@@ -6,10 +6,10 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import ConcatDataset, DataLoader, default_collate
 
-from libero.va_prior.data import (ActionStats, LiberoActionChunkDataset,
-                                  compute_action_stats, trajectory_split)
+from libero.va_prior.data import (ActionStats, LiberoActionChunkDataset, TaskTaggedDataset,
+                                  compute_action_stats_multi, trajectory_split)
 from libero.va_prior.model import VAPriorModel
 
 
@@ -30,15 +30,25 @@ def build_model(args, sample, stats):
     )
 
 
+def combined_dataset(paths, splits, split_name, stats, horizon, obs_horizon):
+    datasets = []
+    for task_id, path in enumerate(paths):
+        base = LiberoActionChunkDataset(path, splits[str(path)][split_name], stats, horizon,
+                                        obs_horizon=obs_horizon)
+        datasets.append(TaskTaggedDataset(base, task_id))
+    return ConcatDataset(datasets)
+
+
 def train(args):
     seed_everything(args.seed)
     out = Path(args.output); out.mkdir(parents=True, exist_ok=True)
-    splits = trajectory_split(args.dataset, args.split_seed)
-    stats = compute_action_stats(args.dataset, splits["train"])
+    paths = [str(Path(x)) for x in args.dataset]
+    splits = {path: trajectory_split(path, args.split_seed) for path in paths}
+    stats = compute_action_stats_multi(paths, {p: splits[p]["train"] for p in paths})
     stats.save(out / "action_stats.json")
     (out / "splits.json").write_text(json.dumps(splits, indent=2))
-    ds = LiberoActionChunkDataset(args.dataset, splits["train"], stats, args.horizon, obs_horizon=args.obs_horizon)
-    val = LiberoActionChunkDataset(args.dataset, splits["val"], stats, args.horizon, obs_horizon=args.obs_horizon)
+    ds = combined_dataset(paths, splits, "train", stats, args.horizon, args.obs_horizon)
+    val = combined_dataset(paths, splits, "val", stats, args.horizon, args.obs_horizon)
     model = build_model(args, ds[0], stats).to(args.device)
     loader = DataLoader(ds, args.batch_size, shuffle=True, num_workers=args.workers,
                         pin_memory=True, persistent_workers=args.workers > 0)
@@ -73,8 +83,12 @@ def load_checkpoint(path, device):
     stats = ActionStats(np.asarray(state["stats"]["mean"], np.float32),
                         np.asarray(state["stats"]["std"], np.float32),
                         state["stats"]["recall_threshold"])
-    ds = LiberoActionChunkDataset(cfg.dataset, state["splits"]["test"], stats, cfg.horizon,
-                                  obs_horizon=getattr(cfg, "obs_horizon", 2))
+    paths = [cfg.dataset] if isinstance(cfg.dataset, str) else cfg.dataset
+    # Backward compatibility with early single-task checkpoints.
+    splits = state["splits"]
+    if "train" in splits:
+        splits = {str(paths[0]): splits}
+    ds = combined_dataset(paths, splits, "test", stats, cfg.horizon, getattr(cfg, "obs_horizon", 2))
     model = build_model(cfg, ds[0], stats).to(device)
     model.load_state_dict(state["model"]); model.eval()
     return model, ds, stats, cfg
@@ -87,11 +101,51 @@ def masked_f1(pred, target, mask):
 
 
 @torch.no_grad()
+def cross_goal_initial_metrics(model, dataset, stats, args):
+    """Can one goal-free initial observation cover actions demonstrated for every goal?"""
+    bases = [x.dataset for x in dataset.datasets]
+    maps = [{key: i for i, key in enumerate(base.index) if key[1] == 0} for base in bases]
+    common = sorted(set.intersection(*(set(x) for x in maps)))
+    index_aligned = len(common)
+    recalls, errors, target_diversity = [], [], []
+    per_goal = {i: [] for i in range(len(bases))}
+    for key in common:
+        items = [bases[i][maps[i][key]] for i in range(len(bases))]
+        image_error = max((x["images"] - items[0]["images"]).abs().mean().item() for x in items)
+        proprio_error = max(torch.sqrt(((x["proprio"] - items[0]["proprio"]) ** 2).mean()).item() for x in items)
+        if image_error > args.match_image_mae or proprio_error > args.match_proprio_rmse:
+            continue
+        targets = torch.stack([x["continuous"] for x in items]).to(args.device)
+        target_diversity.append(torch.pdist(targets.flatten(1)).mean().item() if len(targets) > 1 else 0.0)
+        # Average over each task recording as the visual anchor; goal labels remain hidden.
+        for anchor in range(len(bases)):
+            batch = move(default_collate([items[anchor]]), args.device)
+            candidates = model.candidates(batch, args.k, args.flow_steps, args.cluster_threshold)["candidate_chunks"][0, ..., :-1]
+            distance = torch.linalg.vector_norm((candidates[:, None] - targets[None]) / model.action_std, dim=-1).mean(-1)
+            best = distance.min(0).values
+            errors.extend(best.cpu().tolist())
+            hit = best <= stats.recall_threshold
+            recalls.extend(hit.float().cpu().tolist())
+            for goal in range(len(bases)): per_goal[goal].append(float(hit[goal]))
+    return {
+        "index_aligned_initial_states": index_aligned,
+        "state_matched_initial_states": (len(recalls) // (len(bases) ** 2)) if bases else 0,
+        "match_image_mae_threshold": args.match_image_mae,
+        "match_proprio_rmse_threshold": args.match_proprio_rmse,
+        "macro_recall": float(np.mean(recalls)) if recalls else None,
+        "best_of_k_ade": float(np.mean(errors)) if errors else None,
+        "demonstrated_goal_action_diversity": float(np.mean(target_diversity)) if target_diversity else None,
+        "recall_by_goal_id": {str(k): float(np.mean(v)) for k, v in per_goal.items() if v},
+    }
+
+
+@torch.no_grad()
 def evaluate(args):
     model, ds, stats, cfg = load_checkpoint(args.checkpoint, args.device)
     loader = DataLoader(ds, args.batch_size, num_workers=args.workers)
     totals = {k: [] for k in ("ade", "fde", "best_of_k_ade", "best_of_k_fde", "recall", "diversity")}
     phase = {"early": [], "middle": [], "late": [], "gripper_event": []}
+    per_task = {}
     all_pred, all_true, grip_pred, grip_true, grip_mask = [], [], [], [], []
     for raw in loader:
         batch = move(raw, args.device)
@@ -112,6 +166,11 @@ def evaluate(args):
         totals["fde"].extend(fde[rows, chosen].cpu().tolist())
         totals["best_of_k_ade"].extend(best.cpu().tolist()); totals["best_of_k_fde"].extend(fde.min(-1).values.cpu().tolist())
         totals["recall"].extend((best <= stats.recall_threshold).float().cpu().tolist())
+        for task_id in raw["task_id"].unique().tolist():
+            selected = raw["task_id"] == task_id
+            bucket = per_task.setdefault(str(task_id), {"best_of_k_ade": [], "recall": []})
+            bucket["best_of_k_ade"].extend(best.cpu()[selected].tolist())
+            bucket["recall"].extend((best.cpu()[selected] <= stats.recall_threshold).float().tolist())
         for i in range(len(candidates)):
             valid = candidates[i][weights[i] > 0].flatten(1) / model.action_std.repeat(cfg.horizon)
             div = torch.pdist(valid).mean().item() if len(valid) > 1 else 0.0
@@ -125,6 +184,10 @@ def evaluate(args):
     report = {k: float(np.mean(v)) for k, v in totals.items()}
     report["gripper_f1"] = masked_f1(torch.cat(grip_pred), torch.cat(grip_true), torch.cat(grip_mask))
     report["best_of_k_ade_by_phase"] = {k: (float(np.mean(v)) if v else None) for k, v in phase.items()}
+    task_paths = [cfg.dataset] if isinstance(cfg.dataset, str) else cfg.dataset
+    report["by_goal"] = {Path(task_paths[int(k)]).stem.replace("_demo", ""): {
+        metric: float(np.mean(values)) for metric, values in v.items()} for k, v in per_task.items()}
+    report["cross_goal_initial_coverage"] = cross_goal_initial_metrics(model, ds, stats, args)
     report["num_test_frames"] = len(ds); report["recall_threshold_normalized"] = stats.recall_threshold
     output = Path(args.output); output.mkdir(parents=True, exist_ok=True)
     (output / "metrics.json").write_text(json.dumps(report, indent=2))
@@ -225,7 +288,8 @@ def parser():
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--device", default="cuda"); common.add_argument("--batch-size", type=int, default=64)
     common.add_argument("--workers", type=int, default=4)
-    t = sub.add_parser("train", parents=[common]); t.add_argument("--dataset", required=True); t.add_argument("--output", required=True)
+    t = sub.add_parser("train", parents=[common]); t.add_argument("--dataset", nargs="+", required=True,
+        help="One or more same-scene goal HDF5 files; no goal id is passed to the model")
     t.add_argument("--head", choices=["deterministic", "gmm", "flow"], required=True)
     t.add_argument("--backbone", choices=["tiny", "dinov2", "siglip"], default="dinov2")
     t.add_argument("--horizon", type=int, default=10); t.add_argument("--hidden-dim", type=int, default=256)
@@ -236,6 +300,8 @@ def parser():
     e = sub.add_parser("evaluate", parents=[common]); e.add_argument("--checkpoint", required=True); e.add_argument("--output", required=True)
     e.add_argument("--k", type=int, default=8); e.add_argument("--flow-steps", type=int, default=20)
     e.add_argument("--cluster-threshold", type=float, default=1.0)
+    e.add_argument("--match-image-mae", type=float, default=.05)
+    e.add_argument("--match-proprio-rmse", type=float, default=.05)
     r = sub.add_parser("rollout", parents=[common]); r.add_argument("--checkpoint", required=True)
     r.add_argument("--bddl-file", required=True); r.add_argument("--init-states", required=True); r.add_argument("--output", required=True)
     r.add_argument("--num-init-states", type=int, default=10); r.add_argument("--repeats", type=int, default=20)

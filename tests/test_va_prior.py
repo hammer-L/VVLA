@@ -2,7 +2,7 @@ import h5py
 import numpy as np
 import torch
 
-from libero.va_prior.data import LiberoActionChunkDataset, compute_action_stats, trajectory_split
+from libero.va_prior.data import LiberoActionChunkDataset, compute_action_stats_multi, trajectory_split
 from libero.va_prior.model import VAPriorModel
 
 
@@ -26,7 +26,7 @@ def test_trajectory_split_and_padding(tmp_path):
     split = trajectory_split(path, seed=3)
     assert len(split["train"]) == 8 and len(split["val"]) == 1 and len(split["test"]) == 1
     assert not (set(split["train"]) & set(split["test"]))
-    stats = compute_action_stats(path, split["train"])
+    stats = compute_action_stats_multi([path], {str(path): split["train"]})
     ds = LiberoActionChunkDataset(path, split["train"], stats, horizon=10)
     item = ds[len(ds) - 1]
     assert item["continuous"].shape == (10, 6)

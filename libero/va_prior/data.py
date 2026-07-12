@@ -131,3 +131,34 @@ class LiberoActionChunkDataset(Dataset):
             "gripper_event": torch.tensor(event),
             "index": idx,
         }
+
+
+class TaskTaggedDataset(Dataset):
+    """Attach an evaluation-only task id; the model never consumes it."""
+    def __init__(self, dataset, task_id):
+        self.dataset, self.task_id = dataset, task_id
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, index):
+        item = self.dataset[index]
+        item["task_id"] = torch.tensor(self.task_id)
+        return item
+
+
+def compute_action_stats_multi(dataset_paths, demos_by_path):
+    actions, adjacent = [], []
+    for path in dataset_paths:
+        with h5py.File(path, "r") as f:
+            for demo in demos_by_path[str(path)]:
+                x = np.asarray(f[f"data/{demo}/actions"][:, :-1], np.float32)
+                actions.append(x)
+    joined = np.concatenate(actions)
+    mean, std = joined.mean(0), np.maximum(joined.std(0), 1e-3)
+    for x in actions:
+        if len(x) > 1:
+            adjacent.append(np.linalg.norm(np.diff((x - mean) / std, axis=0), axis=-1))
+    diffs = np.concatenate(adjacent) if adjacent else np.asarray([0.25])
+    return ActionStats(mean.astype(np.float32), std.astype(np.float32),
+                       float(max(np.median(diffs) * 2.0, 0.25)))
