@@ -1,0 +1,4 @@
+# Install after the repository's base requirements.
+# DINOv2 and SigLIP support was added after the base repo's transformers pin.
+transformers>=4.40,<5
+h5py>=3.7
