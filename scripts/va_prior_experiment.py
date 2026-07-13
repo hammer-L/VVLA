@@ -12,7 +12,12 @@ from torch.utils.data import ConcatDataset, DataLoader, default_collate
 from libero.va_prior.data import (ActionStats, LiberoActionChunkDataset, TaskTaggedDataset,
                                   compute_action_stats_multi, trajectory_split)
 from libero.va_prior.model import VAPriorModel
-from libero.va_prior.visualization import action_chunk_figure, action_distributions
+from libero.va_prior.visualization import (action_distributions, restore_projection_geometry,
+                                           scale_controller_actions,
+                                           trajectory_overlay_figure)
+
+
+ACTION_HEAD_DIMS = {"small": 256, "base": 512, "large": 1024}
 
 
 def seed_everything(seed):
@@ -25,10 +30,12 @@ def move(batch, device):
 
 
 def build_model(args, sample, stats):
+    head_size = getattr(args, "action_head_size", "base")
     return VAPriorModel(
         head=args.head, backbone=args.backbone, proprio_dim=sample["proprio"].shape[-1],
         continuous_dim=len(stats.mean), horizon=args.horizon, hidden_dim=args.hidden_dim,
         num_modes=args.num_modes, action_mean=stats.mean, action_std=stats.std,
+        action_head_dim=ACTION_HEAD_DIMS[head_size],
     )
 
 
@@ -41,9 +48,65 @@ def combined_dataset(paths, splits, split_name, stats, horizon, obs_horizon):
     return ConcatDataset(datasets)
 
 
+def goal_name(path):
+    return Path(path).stem.replace("_demo", "")
+
+
+def fixed_goal_batch(dataset):
+    """Return one stable initial validation sample from every non-empty goal."""
+    items, goals = [], []
+    for tagged in dataset.datasets:
+        if len(tagged):
+            items.append(tagged[0])
+            goals.append(goal_name(tagged.dataset.path))
+    return (default_collate(items), goals) if items else (None, [])
+
+
 @torch.no_grad()
-def wandb_visualizations(model, raw_batch, args, wandb):
-    """Build W&B histograms and a trajectory image from one fixed validation batch."""
+def validation_candidate_metrics(model, loader, stats, args):
+    """Compute macro best-of-K recall; this is candidate coverage, not rollout success."""
+    per_goal_hits, per_goal_ade = {}, {}
+    metric_device = torch.device(args.device)
+    cuda_devices = ([metric_device.index if metric_device.index is not None
+                     else torch.cuda.current_device()]
+                    if metric_device.type == "cuda" else [])
+    with torch.random.fork_rng(devices=cuda_devices):
+        torch.manual_seed(args.seed + 104729)
+        if cuda_devices:
+            with torch.cuda.device(cuda_devices[0]):
+                torch.cuda.manual_seed(args.seed + 104729)
+        for raw in loader:
+            batch = move(raw, args.device)
+            result = model.candidates(batch, args.val_k, args.val_flow_steps,
+                                      args.val_cluster_threshold)
+            candidates = result["candidate_chunks"][..., :-1]
+            truth = batch["continuous"] * model.action_std + model.action_mean
+            mask = batch["mask"]
+            distance = torch.linalg.vector_norm(
+                (candidates - truth[:, None]) / model.action_std, dim=-1)
+            per_candidate = (distance * mask[:, None]).sum(-1) / mask.sum(-1, keepdim=True)
+            best = per_candidate.min(-1).values.cpu()
+            for task_id in raw["task_id"].unique().tolist():
+                selected = raw["task_id"] == task_id
+                key = int(task_id)
+                values = best[selected]
+                per_goal_ade.setdefault(key, []).extend(values.tolist())
+                per_goal_hits.setdefault(key, []).extend(
+                    (values <= stats.recall_threshold).float().tolist())
+
+    goal_acc = {key: float(np.mean(values)) for key, values in per_goal_hits.items()}
+    goal_ade = {key: float(np.mean(values)) for key, values in per_goal_ade.items()}
+    return {
+        "acc": float(np.mean(list(goal_acc.values()))) if goal_acc else None,
+        "best_of_k_ade": float(np.mean(list(goal_ade.values()))) if goal_ade else None,
+        "acc_by_goal": goal_acc,
+    }
+
+
+@torch.no_grad()
+def training_visualizations(model, raw_batch, goals, args, wandb, output, epoch,
+                            geometry_cache):
+    """Save balanced trajectory overlays and optionally build W&B media."""
     batch = move(raw_batch, args.device)
     result = model.candidates(batch, args.visualize_k, args.visualize_flow_steps, cluster=False)
     candidate_chunks = result["candidate_chunks"].cpu().numpy()
@@ -53,16 +116,41 @@ def wandb_visualizations(model, raw_batch, args, wandb):
         candidate_chunks, prior_weights, target, raw_batch["gripper"].numpy(),
         raw_batch["mask"].numpy())
     log = {}
-    for dof in range(model.continuous_dim):
-        prefix = f"action_distribution/dof_{dof}"
-        log[f"{prefix}/predicted"] = wandb.Histogram(values["predicted_continuous"][:, dof])
-        log[f"{prefix}/target"] = wandb.Histogram(values["target_continuous"][:, dof])
-    log["action_distribution/gripper/predicted"] = wandb.Histogram(values["predicted_gripper"])
-    log["action_distribution/gripper/target"] = wandb.Histogram(values["target_gripper"])
-    figure = action_chunk_figure(candidate_chunks[0], prior_weights[0])
-    log["action_chunks/relative_trajectory"] = wandb.Image(figure)
+    if wandb is not None:
+        for dof in range(model.continuous_dim):
+            prefix = f"action_distribution/dof_{dof}"
+            log[f"{prefix}/predicted"] = wandb.Histogram(
+                values["predicted_continuous"][:, dof])
+            log[f"{prefix}/target"] = wandb.Histogram(
+                values["target_continuous"][:, dof])
+        log["action_distribution/gripper/predicted"] = wandb.Histogram(
+            values["predicted_gripper"])
+        log["action_distribution/gripper/target"] = wandb.Histogram(
+            values["target_gripper"])
+
     import matplotlib.pyplot as plt
-    plt.close(figure)
+    image_dir = Path(output) / "visualizations" / f"epoch_{epoch:04d}"
+    image_dir.mkdir(parents=True, exist_ok=True)
+    for index, goal in enumerate(goals):
+        image = raw_batch["images"][index, -1, 0].numpy()
+        height, width = image.shape[-2:]
+        key = (raw_batch["dataset_path"][index], raw_batch["demo_id"][index],
+               int(raw_batch["timestep"][index]))
+        if key not in geometry_cache:
+            geometry_cache[key] = restore_projection_geometry(
+                key[0], key[1], key[2], height, width, Path(output) / ".bddl_cache")
+        geometry = geometry_cache[key]
+        candidate_deltas = scale_controller_actions(candidate_chunks[index], geometry)
+        target_deltas = scale_controller_actions(target[index], geometry)
+        figure = trajectory_overlay_figure(
+            image, candidate_deltas, prior_weights[index], target_deltas,
+            raw_batch["mask"][index].numpy(), raw_batch["ee_pos"][index].numpy(),
+            geometry["world_to_camera"], title=goal.replace("_", " "))
+        path = image_dir / f"{goal}.png"
+        figure.savefig(path, dpi=180, bbox_inches="tight")
+        if wandb is not None:
+            log[f"action_chunks/{goal}/trajectory_overlay"] = wandb.Image(str(path))
+        plt.close(figure)
     return log
 
 
@@ -73,6 +161,10 @@ def train(args):
         raise ValueError("--visualize-k must be at least 1")
     if args.visualize_flow_steps < 1:
         raise ValueError("--visualize-flow-steps must be at least 1")
+    if args.val_k < 1:
+        raise ValueError("--val-k must be at least 1")
+    if args.val_flow_steps < 1:
+        raise ValueError("--val-flow-steps must be at least 1")
     seed_everything(args.seed)
     out = Path(args.output); out.mkdir(parents=True, exist_ok=True)
     paths = [str(Path(x)) for x in args.dataset]
@@ -87,8 +179,14 @@ def train(args):
                         pin_memory=True, persistent_workers=args.workers > 0)
     val_loader = DataLoader(val, args.batch_size, num_workers=args.workers)
     optimizer = torch.optim.AdamW((p for p in model.parameters() if p.requires_grad), lr=args.lr, weight_decay=1e-4)
-    best = float("inf")
+    best = float("inf"); best_acc = 0.0
     config = vars(args).copy()
+    config.update({
+        "action_head_dim": model.action_head_dim,
+        "action_head_parameters": model.action_head_parameter_count(),
+        "trainable_parameters": sum(p.numel() for p in model.parameters() if p.requires_grad),
+        "wandb_run_id": None,
+    })
     wandb = None
     if args.use_wandb:
         import wandb as wandb_module
@@ -98,7 +196,18 @@ def train(args):
         if args.wandb_entity:
             init_kwargs["entity"] = args.wandb_entity
         wandb.init(**init_kwargs)
-    fixed_val_batch = next(iter(val_loader), None) if wandb is not None else None
+        config["wandb_run_id"] = wandb.run.id
+        wandb.config.update({key: config[key] for key in (
+            "action_head_dim", "action_head_parameters", "trainable_parameters",
+            "wandb_run_id")}, allow_val_change=True)
+        wandb.run.summary["model/action_head_parameters"] = config["action_head_parameters"]
+        wandb.run.summary["model/trainable_parameters"] = config["trainable_parameters"]
+        wandb.run.summary["model/action_head_size"] = args.action_head_size
+        wandb.run.summary["model/action_head_dim"] = model.action_head_dim
+        wandb.run.summary["val/recall_threshold_normalized"] = stats.recall_threshold
+    fixed_val_batch, visualization_goals = fixed_goal_batch(val)
+    task_goals = {index: goal_name(path) for index, path in enumerate(paths)}
+    geometry_cache = {}
     try:
         for epoch in range(1, args.epochs + 1):
             started = time.time()
@@ -122,16 +231,21 @@ def train(args):
             score = float(np.mean(val_totals["total"])) if val_totals["total"] else train_metrics["total"]
             val_metrics = {key: (float(np.mean(value)) if value else train_metrics[key])
                            for key, value in val_totals.items()}
+            candidate_metrics = validation_candidate_metrics(model, val_loader, stats, args)
+            if candidate_metrics["acc"] is not None:
+                best_acc = max(best_acc, candidate_metrics["acc"])
             is_best = score < best
             if is_best:
                 best = score
-            print(json.dumps({"epoch": epoch, "train_loss": train_metrics["total"], "val_loss": score}))
+            print(json.dumps({"epoch": epoch, "train_loss": train_metrics["total"],
+                              "val_loss": score, "val_acc": candidate_metrics["acc"]}))
             state = {"model": model.state_dict(), "config": config, "stats": {
                 "mean": stats.mean.tolist(), "std": stats.std.tolist(),
                 "recall_threshold": stats.recall_threshold}, "splits": splits}
             torch.save(state, out / "last.pt")
             if is_best:
                 torch.save(state, out / "best.pt")
+            log = {}
             if wandb is not None:
                 log = {
                     "epoch": epoch,
@@ -144,10 +258,18 @@ def train(args):
                     "val/action_loss": val_metrics["action"],
                     "val/gripper_loss": val_metrics["gripper"],
                     "val/best_total_loss": best,
+                    "val/acc": candidate_metrics["acc"],
+                    "val/best_of_k_ade": candidate_metrics["best_of_k_ade"],
+                    "val/best_acc": best_acc,
                 }
-                should_visualize = epoch % args.visualize_every == 0 or epoch == args.epochs
-                if should_visualize and fixed_val_batch is not None:
-                    log.update(wandb_visualizations(model, fixed_val_batch, args, wandb))
+                for task_id, value in candidate_metrics["acc_by_goal"].items():
+                    log[f"val/acc_by_goal/{task_goals[task_id]}"] = value
+            should_visualize = epoch % args.visualize_every == 0 or epoch == args.epochs
+            if should_visualize and fixed_val_batch is not None:
+                log.update(training_visualizations(
+                    model, fixed_val_batch, visualization_goals, args, wandb, out, epoch,
+                    geometry_cache))
+            if wandb is not None:
                 wandb.log(log, step=epoch)
     finally:
         if wandb is not None:
@@ -295,6 +417,47 @@ def observation_batch(history, obs_horizon, device):
             "proprio": torch.stack([x[1] for x in frames])[None].to(device)}
 
 
+def log_rollout_to_wandb(report, args, checkpoint_cfg):
+    """Append closed-loop metrics to the originating training run when possible."""
+    import wandb
+
+    stored_id = getattr(checkpoint_cfg, "wandb_run_id", None)
+    project = args.wandb_project or getattr(checkpoint_cfg, "wandb_project", "libero-va-prior")
+    entity = args.wandb_entity or getattr(checkpoint_cfg, "wandb_entity", None)
+    mode = args.wandb_mode or getattr(checkpoint_cfg, "wandb_mode", "online")
+    run_name = args.wandb_run_name or getattr(checkpoint_cfg, "wandb_run_name", None)
+    init_kwargs = {"project": project, "mode": mode,
+                   "config": {"rollout_checkpoint": str(args.checkpoint)}}
+    if entity:
+        init_kwargs["entity"] = entity
+    if stored_id:
+        init_kwargs.update({"id": stored_id, "resume": "allow"})
+    else:
+        fallback_name = f"{Path(args.checkpoint).parent.name}-rollout"
+        init_kwargs["name"] = run_name or fallback_name
+        print("[warning] Checkpoint has no W&B run id; creating a linked rollout run")
+    wandb.init(**init_kwargs)
+    try:
+        goal = Path(args.bddl_file).stem
+        log = {
+            "rollout/acc": report["success_rate"],
+            "rollout/success_rate": report["success_rate"],
+            "rollout/success_rate_std_across_init_states":
+                report["success_rate_std_across_init_states"],
+            "rollout/mean_steps": report["mean_steps"],
+            "rollout/saturation_rate": report["saturation_rate"],
+        }
+        if report["collision_rate"] is not None:
+            log["rollout/collision_rate"] = report["collision_rate"]
+        wandb.log(log)
+        for key, value in log.items():
+            wandb.run.summary[key] = value
+        wandb.run.summary[f"rollout/by_goal/{goal}/success_rate"] = report["success_rate"]
+        wandb.run.summary[f"rollout/by_goal/{goal}/rollouts"] = report["rollouts"]
+    finally:
+        wandb.finish()
+
+
 @torch.no_grad()
 def rollout(args):
     from libero.libero.envs import OffScreenRenderEnv
@@ -343,6 +506,8 @@ def rollout(args):
     output = Path(args.output); output.mkdir(parents=True, exist_ok=True)
     (output / "rollout_metrics.json").write_text(json.dumps(report, indent=2))
     (output / "rollouts.json").write_text(json.dumps(records, indent=2))
+    if args.use_wandb:
+        log_rollout_to_wandb(report, args, cfg)
     print(json.dumps(report, indent=2))
 
 
@@ -369,6 +534,7 @@ def parser():
         help="One or more same-scene goal HDF5 files; no goal id is passed to the model")
     t.add_argument("--output", required=True)
     t.add_argument("--head", choices=["deterministic", "gmm", "flow"], required=True)
+    t.add_argument("--action-head-size", choices=list(ACTION_HEAD_DIMS), default="base")
     t.add_argument("--backbone", choices=["tiny", "dinov2", "siglip"], default="dinov2")
     t.add_argument("--horizon", type=int, default=10); t.add_argument("--hidden-dim", type=int, default=256)
     t.add_argument("--obs-horizon", type=int, default=2)
@@ -383,6 +549,9 @@ def parser():
     t.add_argument("--visualize-every", type=int, default=5)
     t.add_argument("--visualize-k", type=int, default=8)
     t.add_argument("--visualize-flow-steps", type=int, default=20)
+    t.add_argument("--val-k", type=int, default=8)
+    t.add_argument("--val-flow-steps", type=int, default=20)
+    t.add_argument("--val-cluster-threshold", type=float, default=1.0)
     e = sub.add_parser("evaluate", parents=[common]); e.add_argument("--checkpoint", required=True); e.add_argument("--output", required=True)
     e.add_argument("--k", type=int, default=8); e.add_argument("--flow-steps", type=int, default=20)
     e.add_argument("--cluster-threshold", type=float, default=1.0)
@@ -395,6 +564,11 @@ def parser():
     r.add_argument("--k", type=int, default=8); r.add_argument("--flow-steps", type=int, default=20)
     r.add_argument("--cluster-threshold", type=float, default=1.0); r.add_argument("--saturation-threshold", type=float, default=.99)
     r.add_argument("--seed", type=int, default=0)
+    r.add_argument("--use-wandb", action="store_true")
+    r.add_argument("--wandb-project", default=None)
+    r.add_argument("--wandb-entity", default=None)
+    r.add_argument("--wandb-run-name", default=None)
+    r.add_argument("--wandb-mode", choices=["online", "offline", "disabled"], default=None)
     return p
 
 

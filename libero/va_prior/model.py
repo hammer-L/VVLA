@@ -83,12 +83,13 @@ class Encoder(nn.Module):
 
 
 class FlowHead(nn.Module):
-    def __init__(self, hidden_dim, output_dim):
+    def __init__(self, context_dim, output_dim, head_dim=512):
         super().__init__()
         self.output_dim = output_dim
         self.time = nn.Sequential(nn.Linear(1, 64), nn.SiLU(), nn.Linear(64, 64))
-        self.net = nn.Sequential(nn.Linear(hidden_dim + output_dim + 64, 512), nn.SiLU(),
-                                 nn.Linear(512, 512), nn.SiLU(), nn.Linear(512, output_dim))
+        self.net = nn.Sequential(nn.Linear(context_dim + output_dim + 64, head_dim), nn.SiLU(),
+                                 nn.Linear(head_dim, head_dim), nn.SiLU(),
+                                 nn.Linear(head_dim, output_dim))
 
     def velocity(self, x, t, context):
         return self.net(torch.cat([x, context, self.time(t)], -1))
@@ -111,9 +112,11 @@ class FlowHead(nn.Module):
 
 class VAPriorModel(nn.Module):
     def __init__(self, head, backbone, proprio_dim, continuous_dim, horizon=10,
-                 hidden_dim=256, num_modes=5, action_mean=None, action_std=None):
+                 hidden_dim=256, num_modes=5, action_mean=None, action_std=None,
+                 action_head_dim=512):
         super().__init__()
         self.head_type, self.horizon, self.continuous_dim = head, horizon, continuous_dim
+        self.action_head_dim = action_head_dim
         self.encoder = Encoder(backbone, proprio_dim, hidden_dim)
         mean = torch.zeros(continuous_dim) if action_mean is None else torch.as_tensor(action_mean)
         std = torch.ones(continuous_dim) if action_std is None else torch.as_tensor(action_std)
@@ -124,16 +127,27 @@ class VAPriorModel(nn.Module):
                                      nn.Linear(hidden_dim, horizon))
         self.candidate_projector = nn.Sequential(nn.Linear(flat, hidden_dim), nn.Tanh())
         if head == "deterministic":
-            self.head = nn.Sequential(nn.Linear(hidden_dim, 512), nn.ReLU(), nn.Linear(512, flat))
+            self.head = nn.Sequential(nn.Linear(hidden_dim, action_head_dim), nn.ReLU(),
+                                      nn.Linear(action_head_dim, flat))
         elif head == "gmm":
             self.num_modes = num_modes
-            self.shared = nn.Sequential(nn.Linear(hidden_dim, 512), nn.ReLU())
-            self.means, self.logstds = nn.Linear(512, flat * num_modes), nn.Linear(512, flat * num_modes)
-            self.logits = nn.Linear(512, num_modes)
+            self.shared = nn.Sequential(nn.Linear(hidden_dim, action_head_dim), nn.ReLU())
+            self.means = nn.Linear(action_head_dim, flat * num_modes)
+            self.logstds = nn.Linear(action_head_dim, flat * num_modes)
+            self.logits = nn.Linear(action_head_dim, num_modes)
         elif head == "flow":
-            self.head = FlowHead(hidden_dim, flat)
+            self.head = FlowHead(hidden_dim, flat, action_head_dim)
         else:
             raise ValueError(head)
+
+    def action_head_parameter_count(self):
+        """Count parameters in the continuous-action head only."""
+        if self.head_type in ("deterministic", "flow"):
+            parameters = self.head.parameters()
+        else:
+            modules = (self.shared, self.means, self.logstds, self.logits)
+            parameters = (parameter for module in modules for parameter in module.parameters())
+        return sum(parameter.numel() for parameter in parameters)
 
     def context(self, batch):
         return self.encoder(batch["images"], batch["proprio"])

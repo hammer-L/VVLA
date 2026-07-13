@@ -121,6 +121,10 @@ class LiberoActionChunkDataset(Dataset):
         gripper = (chunk[:, -1] > 0).astype(np.float32)
         progress = t / max(len(actions) - 1, 1)
         event = bool(t > 0 and np.sign(actions[t, -1]) != np.sign(actions[t - 1, -1]))
+        ee_key = "ee_pos" if "ee_pos" in obs else "ee_states"
+        if ee_key not in obs:
+            raise KeyError("Trajectory visualization requires obs/ee_pos or obs/ee_states")
+        ee_pos = np.asarray(obs[ee_key][t], np.float32).reshape(-1)[:3]
         return {
             "images": torch.stack(image_sequence),
             "proprio": torch.stack(proprio_sequence),
@@ -130,6 +134,10 @@ class LiberoActionChunkDataset(Dataset):
             "progress": torch.tensor(progress, dtype=torch.float32),
             "gripper_event": torch.tensor(event),
             "index": idx,
+            "ee_pos": torch.from_numpy(ee_pos),
+            "dataset_path": self.path,
+            "demo_id": demo,
+            "timestep": torch.tensor(t, dtype=torch.long),
         }
 
 

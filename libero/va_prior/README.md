@@ -24,10 +24,14 @@ saved in every run directory, and shared by setting the same `--split-seed`. The
 observation history is two frames (`--obs-horizon 2`); this is distinct from the ten-step
 future action horizon.
 
-## Train the three comparable heads
+## Train the comparable heads and capacities
 
 Run at least seeds 0, 1, and 2. Change `--horizon 1` for the single-action ablation and
 `--backbone siglip` for the frozen-backbone ablation.
+
+`--action-head-size` changes only the continuous-action head width: `small=256`,
+`base=512` (the backward-compatible default), and `large=1024`. Encoder and candidate-feature
+dimensions stay fixed, so this ablation measures action-head capacity rather than total model size.
 
 ```bash
 export CUDA_VISIBLE_DEVICES=1
@@ -79,15 +83,22 @@ python scripts/va_prior_experiment.py train \
 ```
 
 Every epoch logs total, continuous-action, and gripper losses for training and validation,
-plus learning rate and epoch time. Every `--visualize-every` epochs (and always on the final
-epoch), the first fixed validation batch is used to log predicted and target histograms for
-each action degree of freedom. The first validation observation also produces a trajectory
-image: the first three continuous action dimensions are treated as XYZ deltas and integrated
-from a shared origin for every sampled chunk, with gripper traces shown alongside them.
+plus learning rate, epoch time, and `val/acc`. Here `val/acc` is macro-averaged best-of-K
+candidate recall: a validation frame is a hit when any clustered candidate is within the
+data-derived normalized ADE threshold. It uses an oracle only to measure whether the prior
+covers the demonstrated motion; it is not closed-loop task success. Configure it with
+`--val-k`, `--val-flow-steps`, and `--val-cluster-threshold`.
+
+Every `--visualize-every` epochs (and always on the final epoch), one fixed initial validation
+sample per goal is used to log predicted and target histograms for every action degree of
+freedom. For each goal the script also restores the demonstration camera and OSC controller,
+starts at the recorded end-effector position, integrates controller-scaled candidate and
+ground-truth XYZ actions, and projects both trajectories onto the LIBERO `agentview` image.
+The PNG files are saved under `OUTPUT/visualizations/epoch_NNNN/` even when W&B is disabled.
 
 GMM and flow heads sample `--visualize-k` stochastic chunks. A deterministic head has only
 one possible chunk and is intentionally plotted once. Visualization uses the raw stochastic
-samples before candidate clustering, so all requested chunks contribute to the plots and
+samples before candidate clustering, so all requested chunks contribute to the overlays and
 histograms. Use `--wandb-mode offline` to collect a run without uploading immediately, or
 `--wandb-mode disabled` for local smoke tests.
 
@@ -98,6 +109,10 @@ python scripts/va_prior_experiment.py evaluate --checkpoint runs/va/flow_s0/best
 
 python scripts/va_prior_experiment.py rollout --checkpoint runs/va/flow_s0/best.pt --bddl-file /data/libero/bddl_files/libero_goal/open_the_top_drawer_and_put_the_bowl_inside.bddl --init-states /data/libero/init_files/libero_goal/open_the_top_drawer_and_put_the_bowl_inside.pruned_init --output runs/va/flow_s0/rollout
 ```
+
+Add `--use-wandb` to `rollout` to resume the training run stored in the checkpoint and log
+`rollout/acc`, `rollout/success_rate`, and per-goal success summaries. Older checkpoints that
+do not contain a W&B run id create a separate rollout run linked by checkpoint path.
 
 Offline evaluation writes `metrics.json` and `candidate_pca.png`. In addition to per-goal
 metrics, `cross_goal_initial_coverage` uses matched held-out demonstration indices: candidates
