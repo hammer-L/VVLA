@@ -4,6 +4,8 @@ import torch
 
 from libero.va_prior.data import LiberoActionChunkDataset, compute_action_stats_multi, trajectory_split
 from libero.va_prior.model import VAPriorModel
+from libero.va_prior.visualization import (action_chunk_figure, action_distributions,
+                                           integrate_action_chunks)
 
 
 def make_dataset(path, demos=10, length=6):
@@ -44,3 +46,38 @@ def test_all_heads_candidate_contract():
         assert result["candidate_chunks"].shape == (2, 4 if head != "deterministic" else 1, 3, 7)
         assert torch.allclose(result["prior_weights"].sum(-1), torch.ones(2))
         assert result["candidate_features"].shape[-1] == 32
+        raw = model.candidates(batch, k=4, flow_steps=2, cluster=False)
+        expected = 4 if head != "deterministic" else 1
+        assert raw["candidate_chunks"].shape == (2, expected, 3, 7)
+        assert torch.all(raw["prior_weights"] == 1 / expected)
+
+
+def test_integrate_action_chunks_starts_at_shared_origin():
+    chunks = np.asarray([[[1, 0, 0], [0, 2, 0]],
+                         [[0, 0, 3], [1, 1, 1]]], dtype=np.float32)
+    trajectories = integrate_action_chunks(chunks)
+    assert trajectories.shape == (2, 3, 3)
+    np.testing.assert_array_equal(trajectories[:, 0], np.zeros((2, 3)))
+    np.testing.assert_array_equal(trajectories[0, -1], [1, 2, 0])
+    np.testing.assert_array_equal(trajectories[1, -1], [1, 1, 4])
+
+
+def test_action_distributions_ignore_padding_and_zero_weight_candidates():
+    candidates = np.asarray([[[[1, 2, 3, -1], [4, 5, 6, 1]],
+                              [[9, 9, 9, 1], [9, 9, 9, 1]]]], dtype=np.float32)
+    values = action_distributions(
+        candidates, np.asarray([[1, 0]], dtype=np.float32),
+        np.asarray([[[10, 11, 12], [20, 21, 22]]], dtype=np.float32),
+        np.asarray([[0, 1]], dtype=np.float32), np.asarray([[True, False]]))
+    np.testing.assert_array_equal(values["predicted_continuous"], [[1, 2, 3], [4, 5, 6]])
+    np.testing.assert_array_equal(values["target_continuous"], [[10, 11, 12]])
+    np.testing.assert_array_equal(values["predicted_gripper"], [-1, 1])
+    np.testing.assert_array_equal(values["target_gripper"], [-1])
+
+
+def test_action_chunk_figure_falls_back_below_three_continuous_dofs():
+    figure = action_chunk_figure(np.zeros((1, 3, 3), dtype=np.float32), np.ones(1))
+    assert len(figure.axes) == 2
+    assert "XYZ unavailable" in figure.axes[0].get_title()
+    import matplotlib.pyplot as plt
+    plt.close(figure)

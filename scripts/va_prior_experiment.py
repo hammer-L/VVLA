@@ -2,6 +2,7 @@
 import argparse
 import json
 import random
+import time
 from pathlib import Path
 
 import numpy as np
@@ -11,6 +12,7 @@ from torch.utils.data import ConcatDataset, DataLoader, default_collate
 from libero.va_prior.data import (ActionStats, LiberoActionChunkDataset, TaskTaggedDataset,
                                   compute_action_stats_multi, trajectory_split)
 from libero.va_prior.model import VAPriorModel
+from libero.va_prior.visualization import action_chunk_figure, action_distributions
 
 
 def seed_everything(seed):
@@ -39,7 +41,38 @@ def combined_dataset(paths, splits, split_name, stats, horizon, obs_horizon):
     return ConcatDataset(datasets)
 
 
+@torch.no_grad()
+def wandb_visualizations(model, raw_batch, args, wandb):
+    """Build W&B histograms and a trajectory image from one fixed validation batch."""
+    batch = move(raw_batch, args.device)
+    result = model.candidates(batch, args.visualize_k, args.visualize_flow_steps, cluster=False)
+    candidate_chunks = result["candidate_chunks"].cpu().numpy()
+    prior_weights = result["prior_weights"].cpu().numpy()
+    target = (batch["continuous"] * model.action_std + model.action_mean).cpu().numpy()
+    values = action_distributions(
+        candidate_chunks, prior_weights, target, raw_batch["gripper"].numpy(),
+        raw_batch["mask"].numpy())
+    log = {}
+    for dof in range(model.continuous_dim):
+        prefix = f"action_distribution/dof_{dof}"
+        log[f"{prefix}/predicted"] = wandb.Histogram(values["predicted_continuous"][:, dof])
+        log[f"{prefix}/target"] = wandb.Histogram(values["target_continuous"][:, dof])
+    log["action_distribution/gripper/predicted"] = wandb.Histogram(values["predicted_gripper"])
+    log["action_distribution/gripper/target"] = wandb.Histogram(values["target_gripper"])
+    figure = action_chunk_figure(candidate_chunks[0], prior_weights[0])
+    log["action_chunks/relative_trajectory"] = wandb.Image(figure)
+    import matplotlib.pyplot as plt
+    plt.close(figure)
+    return log
+
+
 def train(args):
+    if args.visualize_every < 1:
+        raise ValueError("--visualize-every must be at least 1")
+    if args.visualize_k < 1:
+        raise ValueError("--visualize-k must be at least 1")
+    if args.visualize_flow_steps < 1:
+        raise ValueError("--visualize-flow-steps must be at least 1")
     seed_everything(args.seed)
     out = Path(args.output); out.mkdir(parents=True, exist_ok=True)
     paths = [str(Path(x)) for x in args.dataset]
@@ -56,25 +89,69 @@ def train(args):
     optimizer = torch.optim.AdamW((p for p in model.parameters() if p.requires_grad), lr=args.lr, weight_decay=1e-4)
     best = float("inf")
     config = vars(args).copy()
-    for epoch in range(1, args.epochs + 1):
-        model.train(); running = 0.0
-        for batch in loader:
-            optimizer.zero_grad(set_to_none=True)
-            loss, _ = model.loss(move(batch, args.device)); loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
-            optimizer.step(); running += loss.item()
-        model.eval(); values = []
-        with torch.no_grad():
-            for batch in val_loader:
-                values.append(model.loss(move(batch, args.device))[0].item())
-        score = float(np.mean(values)) if values else running / max(len(loader), 1)
-        print(json.dumps({"epoch": epoch, "train_loss": running / max(len(loader), 1), "val_loss": score}))
-        state = {"model": model.state_dict(), "config": config, "stats": {
-            "mean": stats.mean.tolist(), "std": stats.std.tolist(),
-            "recall_threshold": stats.recall_threshold}, "splits": splits}
-        torch.save(state, out / "last.pt")
-        if score < best:
-            best = score; torch.save(state, out / "best.pt")
+    wandb = None
+    if args.use_wandb:
+        import wandb as wandb_module
+        wandb = wandb_module
+        init_kwargs = {"project": args.wandb_project, "config": config, "mode": args.wandb_mode,
+                       "name": args.wandb_run_name or out.name}
+        if args.wandb_entity:
+            init_kwargs["entity"] = args.wandb_entity
+        wandb.init(**init_kwargs)
+    fixed_val_batch = next(iter(val_loader), None) if wandb is not None else None
+    try:
+        for epoch in range(1, args.epochs + 1):
+            started = time.time()
+            model.train(); train_totals = {"total": 0.0, "action": 0.0, "gripper": 0.0}
+            for batch in loader:
+                optimizer.zero_grad(set_to_none=True)
+                loss, parts = model.loss(move(batch, args.device)); loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+                optimizer.step()
+                train_totals["total"] += loss.item()
+                train_totals["action"] += parts["action"].item()
+                train_totals["gripper"] += parts["gripper"].item()
+            model.eval(); val_totals = {"total": [], "action": [], "gripper": []}
+            with torch.no_grad():
+                for batch in val_loader:
+                    loss, parts = model.loss(move(batch, args.device))
+                    val_totals["total"].append(loss.item())
+                    val_totals["action"].append(parts["action"].item())
+                    val_totals["gripper"].append(parts["gripper"].item())
+            train_metrics = {key: value / max(len(loader), 1) for key, value in train_totals.items()}
+            score = float(np.mean(val_totals["total"])) if val_totals["total"] else train_metrics["total"]
+            val_metrics = {key: (float(np.mean(value)) if value else train_metrics[key])
+                           for key, value in val_totals.items()}
+            is_best = score < best
+            if is_best:
+                best = score
+            print(json.dumps({"epoch": epoch, "train_loss": train_metrics["total"], "val_loss": score}))
+            state = {"model": model.state_dict(), "config": config, "stats": {
+                "mean": stats.mean.tolist(), "std": stats.std.tolist(),
+                "recall_threshold": stats.recall_threshold}, "splits": splits}
+            torch.save(state, out / "last.pt")
+            if is_best:
+                torch.save(state, out / "best.pt")
+            if wandb is not None:
+                log = {
+                    "epoch": epoch,
+                    "train/total_loss": train_metrics["total"],
+                    "train/action_loss": train_metrics["action"],
+                    "train/gripper_loss": train_metrics["gripper"],
+                    "train/learning_rate": optimizer.param_groups[0]["lr"],
+                    "train/epoch_time_sec": time.time() - started,
+                    "val/total_loss": val_metrics["total"],
+                    "val/action_loss": val_metrics["action"],
+                    "val/gripper_loss": val_metrics["gripper"],
+                    "val/best_total_loss": best,
+                }
+                should_visualize = epoch % args.visualize_every == 0 or epoch == args.epochs
+                if should_visualize and fixed_val_batch is not None:
+                    log.update(wandb_visualizations(model, fixed_val_batch, args, wandb))
+                wandb.log(log, step=epoch)
+    finally:
+        if wandb is not None:
+            wandb.finish()
 
 
 def load_checkpoint(path, device):
@@ -298,6 +375,14 @@ def parser():
     t.add_argument("--num-modes", type=int, default=5); t.add_argument("--epochs", type=int, default=50)
     t.add_argument("--lr", type=float, default=3e-4); t.add_argument("--seed", type=int, default=0)
     t.add_argument("--split-seed", type=int, default=0)
+    t.add_argument("--use-wandb", action="store_true")
+    t.add_argument("--wandb-project", default="libero-va-prior")
+    t.add_argument("--wandb-entity", default=None)
+    t.add_argument("--wandb-run-name", default=None)
+    t.add_argument("--wandb-mode", choices=["online", "offline", "disabled"], default="online")
+    t.add_argument("--visualize-every", type=int, default=5)
+    t.add_argument("--visualize-k", type=int, default=8)
+    t.add_argument("--visualize-flow-steps", type=int, default=20)
     e = sub.add_parser("evaluate", parents=[common]); e.add_argument("--checkpoint", required=True); e.add_argument("--output", required=True)
     e.add_argument("--k", type=int, default=8); e.add_argument("--flow-steps", type=int, default=20)
     e.add_argument("--cluster-threshold", type=float, default=1.0)

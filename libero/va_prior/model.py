@@ -157,7 +157,7 @@ class VAPriorModel(nn.Module):
         return action_loss + grip_loss, {"action": action_loss.detach(), "gripper": grip_loss.detach()}
 
     @torch.no_grad()
-    def candidates(self, batch, k=8, flow_steps=20, cluster_threshold=1.0):
+    def candidates(self, batch, k=8, flow_steps=20, cluster_threshold=1.0, cluster=True):
         """Return the stable interface consumed by a future language/MoE selector."""
         context = self.context(batch)
         b, d = len(context), self.horizon * self.continuous_dim
@@ -170,7 +170,13 @@ class VAPriorModel(nn.Module):
         expanded_context = context[:, None].expand(-1, raw.shape[1], -1)
         grip_input = torch.cat([expanded_context, raw], -1).flatten(0, 1)
         grip = (self.gripper(grip_input).sigmoid() > 0.5).float().view(b, raw.shape[1], self.horizon)
-        medoids, weights, medoid_indices = cluster_medoids(raw, cluster_threshold)
+        if cluster:
+            medoids, weights, medoid_indices = cluster_medoids(raw, cluster_threshold)
+        else:
+            medoids = raw
+            weights = torch.full((b, raw.shape[1]), 1.0 / raw.shape[1],
+                                 device=raw.device, dtype=raw.dtype)
+            medoid_indices = torch.arange(raw.shape[1], device=raw.device)[None].expand(b, -1)
         grip = grip.gather(1, medoid_indices[..., None].expand(-1, -1, self.horizon))
         features = self.candidate_projector(medoids) + context[:, None]
         continuous = medoids.view(b, medoids.shape[1], self.horizon, self.continuous_dim)

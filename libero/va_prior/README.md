@@ -62,6 +62,35 @@ done
 
 `--backbone tiny` is an offline smoke-test option; it is not an experimental result.
 
+## Weights & Biases training visualizations
+
+Enable W&B on any training command with:
+
+```bash
+python scripts/va_prior_experiment.py train \
+  --dataset "${DATASETS[@]}" \
+  --output runs/va/flow_s0 \
+  --head flow \
+  --use-wandb \
+  --wandb-project libero-va-prior \
+  --wandb-run-name flow_s0 \
+  --visualize-every 5 \
+  --visualize-k 8
+```
+
+Every epoch logs total, continuous-action, and gripper losses for training and validation,
+plus learning rate and epoch time. Every `--visualize-every` epochs (and always on the final
+epoch), the first fixed validation batch is used to log predicted and target histograms for
+each action degree of freedom. The first validation observation also produces a trajectory
+image: the first three continuous action dimensions are treated as XYZ deltas and integrated
+from a shared origin for every sampled chunk, with gripper traces shown alongside them.
+
+GMM and flow heads sample `--visualize-k` stochastic chunks. A deterministic head has only
+one possible chunk and is intentionally plotted once. Visualization uses the raw stochastic
+samples before candidate clustering, so all requested chunks contribute to the plots and
+histograms. Use `--wandb-mode offline` to collect a run without uploading immediately, or
+`--wandb-mode disabled` for local smoke tests.
+
 ## Offline and closed-loop evaluation
 
 ```bash
