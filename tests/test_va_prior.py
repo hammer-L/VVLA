@@ -9,7 +9,7 @@ from libero.va_prior.data import (ActionStats, LiberoActionChunkDataset,
 from libero.va_prior.model import VAPriorModel
 from libero.va_prior.visualization import (action_chunk_figure, action_distributions,
                                            integrate_action_chunks, project_world_points,
-                                           _resolve_bddl_file,
+                                           _resolve_bddl_file, _rewrite_libero_asset_paths,
                                            scale_controller_actions,
                                            trajectory_overlay_figure)
 from scripts.va_prior_experiment import log_rollout_to_wandb, validation_candidate_metrics
@@ -147,6 +147,16 @@ def test_bddl_resolution_prefers_dataset_goal_over_stale_metadata(tmp_path):
         data_group, env_meta, tmp_path,
         tmp_path / "open_the_middle_drawer_of_the_cabinet_demo.hdf5")
     assert resolved.name == "open_the_middle_drawer_of_the_cabinet.bddl"
+
+
+def test_stale_chiliocosm_asset_paths_are_rewritten():
+    stale = ("/Users/yifengz/workspace/libero-dev/chiliocosm/assets/"
+             "stable_scanned_objects/akita_black_bowl/visual/akita_black_bowl_vis.msh")
+    xml = f'<mujoco><asset><mesh name="bowl" file="{stale}"/></asset></mujoco>'
+    rewritten = _rewrite_libero_asset_paths(xml)
+    assert stale not in rewritten
+    assert ("stable_scanned_objects/akita_black_bowl/visual/akita_black_bowl_vis.msh"
+            in rewritten.replace("\\", "/"))
 
 
 def test_validation_acc_is_macro_best_of_k_recall():

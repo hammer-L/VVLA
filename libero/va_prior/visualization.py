@@ -2,6 +2,8 @@
 
 import json
 from pathlib import Path
+import warnings
+import xml.etree.ElementTree as ET
 
 import numpy as np
 
@@ -140,6 +142,39 @@ def _bddl_roots():
     return list(dict.fromkeys(roots))
 
 
+def _asset_roots():
+    """Return configured and code-local LIBERO asset roots in priority order."""
+    roots = []
+    try:
+        from libero.libero import get_libero_path
+        roots.append(Path(get_libero_path("assets")).expanduser().resolve())
+    except (ImportError, OSError, AssertionError, KeyError, TypeError):
+        pass
+    roots.append(Path(__file__).resolve().parents[1] / "libero" / "assets")
+    return list(dict.fromkeys(roots))
+
+
+def _rewrite_libero_asset_paths(xml_string):
+    """Replace stale machine-specific LIBERO mesh and texture paths in MuJoCo XML."""
+    tree = ET.fromstring(xml_string)
+    roots = _asset_roots()
+    for element in tree.iter():
+        old_path = element.get("file")
+        if not old_path or Path(old_path).exists():
+            continue
+        parts = Path(old_path.replace("\\", "/")).parts
+        if "robosuite" in parts or "assets" not in parts:
+            continue
+        asset_index = max(index for index, part in enumerate(parts) if part == "assets")
+        relative = Path(*parts[asset_index + 1:])
+        for root in roots:
+            candidate = root / relative
+            if candidate.exists():
+                element.set("file", str(candidate))
+                break
+    return ET.tostring(tree, encoding="utf8").decode("utf8")
+
+
 def _resolve_bddl_file(data_group, env_meta, cache_dir, dataset_path=None):
     configured = (env_meta.get("bddl_file")
                   or env_meta.get("env_kwargs", {}).get("bddl_file_name")
@@ -214,15 +249,25 @@ def restore_projection_geometry(dataset_path, demo_id, timestep, image_height,
         group = data[demo_id]
         model_xml = _decode_attribute(group.attrs["model_file"])
         model_xml = libero_utils.postprocess_model_xml(model_xml, {})
+        model_xml = _rewrite_libero_asset_paths(model_xml)
         state = np.asarray(group["states"][int(timestep)])
 
-    env = TASK_MAPPING[env_meta["problem_name"]](**env_kwargs)
+    make_env = lambda: TASK_MAPPING[env_meta["problem_name"]](**env_kwargs)
+    env = make_env()
     try:
         env.reset()
-        env.reset_from_xml_string(model_xml)
-        env.sim.reset()
-        env.sim.set_state_from_flattened(state)
-        env.sim.forward()
+        try:
+            env.reset_from_xml_string(model_xml)
+            env.sim.reset()
+            env.sim.set_state_from_flattened(state)
+            env.sim.forward()
+        except Exception as exc:
+            env.close()
+            warnings.warn(
+                f"Could not restore exact demonstration XML/state ({exc}); "
+                "using the current BDDL environment for fixed agentview geometry")
+            env = make_env()
+            env.reset()
         camera = camera_utils.get_camera_transform_matrix(
             env.sim, "agentview", image_height, image_width)
         controller = env.robots[0].controller
