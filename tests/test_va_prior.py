@@ -9,6 +9,7 @@ from libero.va_prior.data import (ActionStats, LiberoActionChunkDataset,
 from libero.va_prior.model import VAPriorModel
 from libero.va_prior.visualization import (action_chunk_figure, action_distributions,
                                            integrate_action_chunks, project_world_points,
+                                           _resolve_bddl_file,
                                            scale_controller_actions,
                                            trajectory_overlay_figure)
 from scripts.va_prior_experiment import log_rollout_to_wandb, validation_candidate_metrics
@@ -134,6 +135,18 @@ def test_controller_scaling_projection_and_overlay(tmp_path):
     assert path.stat().st_size > 0
     import matplotlib.pyplot as plt
     plt.close(figure)
+
+
+def test_bddl_resolution_prefers_dataset_goal_over_stale_metadata(tmp_path):
+    data_group = SimpleNamespace(attrs={})
+    env_meta = {
+        "bddl_file": "chiliocosm/bddl_files/libero_goal/open_the_middle_layer_of_the_drawer.bddl",
+        "env_kwargs": {},
+    }
+    resolved = _resolve_bddl_file(
+        data_group, env_meta, tmp_path,
+        tmp_path / "open_the_middle_drawer_of_the_cabinet_demo.hdf5")
+    assert resolved.name == "open_the_middle_drawer_of_the_cabinet.bddl"
 
 
 def test_validation_acc_is_macro_best_of_k_recall():

@@ -128,20 +128,62 @@ def _decode_attribute(value):
     return value.decode("utf-8") if isinstance(value, bytes) else value
 
 
-def _resolve_bddl_file(data_group, env_meta, cache_dir):
+def _bddl_roots():
+    """Return configured and code-local BDDL roots in priority order."""
+    roots = []
+    try:
+        from libero.libero import get_libero_path
+        roots.append(Path(get_libero_path("bddl_files")).expanduser().resolve())
+    except (ImportError, OSError, AssertionError, KeyError, TypeError):
+        pass
+    roots.append(Path(__file__).resolve().parents[1] / "libero" / "bddl_files")
+    return list(dict.fromkeys(roots))
+
+
+def _resolve_bddl_file(data_group, env_meta, cache_dir, dataset_path=None):
     configured = (env_meta.get("bddl_file")
                   or env_meta.get("env_kwargs", {}).get("bddl_file_name")
                   or _decode_attribute(data_group.attrs.get("bddl_file_name", "")))
+    benchmark_roots = _bddl_roots()
+    filenames = []
+    if dataset_path:
+        dataset_stem = Path(dataset_path).stem
+        if dataset_stem.endswith("_demo"):
+            dataset_stem = dataset_stem[:-5]
+        filenames.append(f"{dataset_stem}.bddl")
+        for benchmark_root in benchmark_roots:
+            dataset_matches = list(benchmark_root.rglob(filenames[0]))
+            if dataset_matches:
+                return dataset_matches[0]
     if configured and Path(configured).exists():
         return Path(configured)
-    filename = Path(configured).name if configured else None
-    benchmark_root = Path(__file__).resolve().parents[1] / "libero" / "bddl_files"
-    matches = list(benchmark_root.rglob(filename)) if filename else []
-    if matches:
-        return matches[0]
+    if configured:
+        filenames.append(Path(configured).name)
+    for filename in dict.fromkeys(filenames[1:] if dataset_path else filenames):
+        for benchmark_root in benchmark_roots:
+            matches = list(benchmark_root.rglob(filename))
+            if matches:
+                return matches[0]
+
+    problem_info = _decode_attribute(data_group.attrs.get("problem_info", ""))
+    if problem_info:
+        instruction = json.loads(problem_info).get("language_instruction", "")
+        if isinstance(instruction, list):
+            instruction = "".join(instruction)
+        instruction = str(instruction).strip().strip('"').casefold()
+        if instruction:
+            marker = f"(:language {instruction})"
+            for benchmark_root in benchmark_roots:
+                for candidate in benchmark_root.rglob("*.bddl"):
+                    if marker in candidate.read_text().casefold():
+                        return candidate
+
     content = _decode_attribute(data_group.attrs.get("bddl_file_content", ""))
+    filename = filenames[0] if filenames else None
     if not content or not filename:
-        raise FileNotFoundError(f"Could not resolve BDDL file {configured!r}")
+        tried = ", ".join(filenames) or repr(configured)
+        roots = ", ".join(str(root) for root in benchmark_roots)
+        raise FileNotFoundError(f"Could not resolve BDDL file; tried {tried} under {roots}")
     cache_dir = Path(cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
     destination = cache_dir / filename
@@ -161,7 +203,7 @@ def restore_projection_geometry(dataset_path, demo_id, timestep, image_height,
     with h5py.File(dataset_path, "r") as dataset:
         data = dataset["data"]
         env_meta = json.loads(_decode_attribute(data.attrs["env_args"]))
-        bddl_file = _resolve_bddl_file(data, env_meta, cache_dir)
+        bddl_file = _resolve_bddl_file(data, env_meta, cache_dir, dataset_path)
         env_kwargs = dict(env_meta["env_kwargs"])
         env_kwargs.update({
             "bddl_file_name": str(bddl_file),

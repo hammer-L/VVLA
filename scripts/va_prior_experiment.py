@@ -3,6 +3,7 @@ import argparse
 import json
 import random
 import time
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -131,26 +132,36 @@ def training_visualizations(model, raw_batch, goals, args, wandb, output, epoch,
     import matplotlib.pyplot as plt
     image_dir = Path(output) / "visualizations" / f"epoch_{epoch:04d}"
     image_dir.mkdir(parents=True, exist_ok=True)
+    failed_overlays = 0
     for index, goal in enumerate(goals):
-        image = raw_batch["images"][index, -1, 0].numpy()
-        height, width = image.shape[-2:]
-        key = (raw_batch["dataset_path"][index], raw_batch["demo_id"][index],
-               int(raw_batch["timestep"][index]))
-        if key not in geometry_cache:
-            geometry_cache[key] = restore_projection_geometry(
-                key[0], key[1], key[2], height, width, Path(output) / ".bddl_cache")
-        geometry = geometry_cache[key]
-        candidate_deltas = scale_controller_actions(candidate_chunks[index], geometry)
-        target_deltas = scale_controller_actions(target[index], geometry)
-        figure = trajectory_overlay_figure(
-            image, candidate_deltas, prior_weights[index], target_deltas,
-            raw_batch["mask"][index].numpy(), raw_batch["ee_pos"][index].numpy(),
-            geometry["world_to_camera"], title=goal.replace("_", " "))
-        path = image_dir / f"{goal}.png"
-        figure.savefig(path, dpi=180, bbox_inches="tight")
-        if wandb is not None:
-            log[f"action_chunks/{goal}/trajectory_overlay"] = wandb.Image(str(path))
-        plt.close(figure)
+        figure = None
+        try:
+            image = raw_batch["images"][index, -1, 0].numpy()
+            height, width = image.shape[-2:]
+            key = (raw_batch["dataset_path"][index], raw_batch["demo_id"][index],
+                   int(raw_batch["timestep"][index]))
+            if key not in geometry_cache:
+                geometry_cache[key] = restore_projection_geometry(
+                    key[0], key[1], key[2], height, width, Path(output) / ".bddl_cache")
+            geometry = geometry_cache[key]
+            candidate_deltas = scale_controller_actions(candidate_chunks[index], geometry)
+            target_deltas = scale_controller_actions(target[index], geometry)
+            figure = trajectory_overlay_figure(
+                image, candidate_deltas, prior_weights[index], target_deltas,
+                raw_batch["mask"][index].numpy(), raw_batch["ee_pos"][index].numpy(),
+                geometry["world_to_camera"], title=goal.replace("_", " "))
+            path = image_dir / f"{goal}.png"
+            figure.savefig(path, dpi=180, bbox_inches="tight")
+            if wandb is not None:
+                log[f"action_chunks/{goal}/trajectory_overlay"] = wandb.Image(str(path))
+        except Exception as exc:
+            failed_overlays += 1
+            warnings.warn(f"Skipping trajectory overlay for {goal}: {exc}")
+        finally:
+            if figure is not None:
+                plt.close(figure)
+    if wandb is not None:
+        log["visualization/failed_overlays"] = failed_overlays
     return log
 
 
