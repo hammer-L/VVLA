@@ -227,9 +227,9 @@ def _resolve_bddl_file(data_group, env_meta, cache_dir, dataset_path=None):
     return destination
 
 
-def restore_projection_geometry(dataset_path, demo_id, timestep, image_height,
-                                image_width, cache_dir, camera_name="agentview"):
-    """Restore a demonstration state and render camera/controller geometry."""
+def restore_projection_geometries(dataset_path, demo_id, timestep, image_height,
+                                  image_width, cache_dir, camera_names):
+    """Restore one demonstration state and render several camera geometries."""
     import h5py
     from robosuite.utils import camera_utils
     from libero.libero.envs import TASK_MAPPING
@@ -265,22 +265,13 @@ def restore_projection_geometry(dataset_path, demo_id, timestep, image_height,
             env.close()
             warnings.warn(
                 f"Could not restore exact demonstration XML/state ({exc}); "
-                f"using the current BDDL environment for fixed {camera_name} geometry")
+                "using the current BDDL environment for fixed-camera geometries")
             env = make_env()
             env.reset()
-        camera = camera_utils.get_camera_transform_matrix(
-            env.sim, camera_name, image_height, image_width)
-        # MuJoCo renders from a bottom-left origin, while images and the camera
-        # projection helper use a top-left origin.
-        image = env.sim.render(
-            camera_name=camera_name, height=image_height, width=image_width)[::-1]
         controller = env.robots[0].controller
         control_dim = int(controller.control_dim)
         controller.scale_action(np.zeros(control_dim, dtype=np.float32))
-        geometry = {
-            "image": np.asarray(image),
-            "camera_name": camera_name,
-            "world_to_camera": np.asarray(camera),
+        controller_geometry = {
             "control_dim": control_dim,
             "input_min": np.asarray(controller.input_min),
             "input_max": np.asarray(controller.input_max),
@@ -288,9 +279,31 @@ def restore_projection_geometry(dataset_path, demo_id, timestep, image_height,
             "input_transform": np.asarray(controller.action_input_transform),
             "output_transform": np.asarray(controller.action_output_transform),
         }
+        geometries = {}
+        for camera_name in camera_names:
+            camera = camera_utils.get_camera_transform_matrix(
+                env.sim, camera_name, image_height, image_width)
+            # MuJoCo renders from a bottom-left origin, while images and the
+            # camera projection helper use a top-left origin.
+            image = env.sim.render(
+                camera_name=camera_name, height=image_height, width=image_width)[::-1]
+            geometries[camera_name] = {
+                **controller_geometry,
+                "image": np.asarray(image),
+                "camera_name": camera_name,
+                "world_to_camera": np.asarray(camera),
+            }
     finally:
         env.close()
-    return geometry
+    return geometries
+
+
+def restore_projection_geometry(dataset_path, demo_id, timestep, image_height,
+                                image_width, cache_dir, camera_name="agentview"):
+    """Backward-compatible single-camera geometry helper."""
+    return restore_projection_geometries(
+        dataset_path, demo_id, timestep, image_height, image_width, cache_dir,
+        [camera_name])[camera_name]
 
 
 def action_distributions(candidate_chunks, prior_weights, target_continuous,

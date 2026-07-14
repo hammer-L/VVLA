@@ -13,7 +13,8 @@ from torch.utils.data import ConcatDataset, DataLoader, default_collate
 from libero.va_prior.data import (ActionStats, LiberoActionChunkDataset, TaskTaggedDataset,
                                   compute_action_stats_multi, trajectory_split)
 from libero.va_prior.model import VAPriorModel
-from libero.va_prior.visualization import (action_distributions, restore_projection_geometry,
+from libero.va_prior.visualization import (action_distributions,
+                                           restore_projection_geometries,
                                            scale_controller_actions,
                                            trajectory_overlay_figure)
 
@@ -134,34 +135,45 @@ def training_visualizations(model, raw_batch, goals, args, wandb, output, epoch,
     image_dir.mkdir(parents=True, exist_ok=True)
     failed_overlays = 0
     for index, goal in enumerate(goals):
-        figure = None
         try:
             recorded_image = raw_batch["images"][index, -1, 0].numpy()
             height, width = recorded_image.shape[-2:]
             key = (raw_batch["dataset_path"][index], raw_batch["demo_id"][index],
-                   int(raw_batch["timestep"][index]), args.visualization_camera)
+                   int(raw_batch["timestep"][index]), tuple(args.visualization_cameras))
             if key not in geometry_cache:
-                geometry_cache[key] = restore_projection_geometry(
+                geometry_cache[key] = restore_projection_geometries(
                     key[0], key[1], key[2], height, width, Path(output) / ".bddl_cache",
-                    camera_name=key[3])
-            geometry = geometry_cache[key]
-            image = geometry["image"]
-            candidate_deltas = scale_controller_actions(candidate_chunks[index], geometry)
-            target_deltas = scale_controller_actions(target[index], geometry)
-            figure = trajectory_overlay_figure(
-                image, candidate_deltas, prior_weights[index], target_deltas,
-                raw_batch["mask"][index].numpy(), raw_batch["ee_pos"][index].numpy(),
-                geometry["world_to_camera"], title=goal.replace("_", " "))
-            path = image_dir / f"{goal}.png"
-            figure.savefig(path, dpi=180, bbox_inches="tight")
-            if wandb is not None:
-                log[f"action_chunks/{goal}/trajectory_overlay"] = wandb.Image(str(path))
+                    camera_names=key[3])
+            geometries = geometry_cache[key]
+            reference_geometry = geometries[args.visualization_cameras[0]]
+            candidate_deltas = scale_controller_actions(
+                candidate_chunks[index], reference_geometry)
+            target_deltas = scale_controller_actions(target[index], reference_geometry)
         except Exception as exc:
-            failed_overlays += 1
-            warnings.warn(f"Skipping trajectory overlay for {goal}: {exc}")
-        finally:
-            if figure is not None:
-                plt.close(figure)
+            failed_overlays += len(args.visualization_cameras)
+            warnings.warn(f"Skipping trajectory overlays for {goal}: {exc}")
+            continue
+
+        for camera_name in args.visualization_cameras:
+            figure = None
+            try:
+                geometry = geometries[camera_name]
+                figure = trajectory_overlay_figure(
+                    geometry["image"], candidate_deltas, prior_weights[index], target_deltas,
+                    raw_batch["mask"][index].numpy(), raw_batch["ee_pos"][index].numpy(),
+                    geometry["world_to_camera"],
+                    title=f'{goal.replace("_", " ")} — {camera_name}')
+                path = image_dir / f"{goal}_{camera_name}.png"
+                figure.savefig(path, dpi=180, bbox_inches="tight")
+                if wandb is not None:
+                    log[f"action_chunks/{goal}/{camera_name}"] = wandb.Image(str(path))
+            except Exception as exc:
+                failed_overlays += 1
+                warnings.warn(
+                    f"Skipping {camera_name} trajectory overlay for {goal}: {exc}")
+            finally:
+                if figure is not None:
+                    plt.close(figure)
     if wandb is not None:
         log["visualization/failed_overlays"] = failed_overlays
     return log
@@ -562,10 +574,10 @@ def parser():
     t.add_argument("--visualize-every", type=int, default=5)
     t.add_argument("--visualize-k", type=int, default=8)
     t.add_argument("--visualize-flow-steps", type=int, default=20)
-    t.add_argument("--visualization-camera",
+    t.add_argument("--visualization-cameras", "--visualization-camera", nargs="+",
                    choices=["frontview", "sideview", "birdview", "agentview"],
-                   default="frontview",
-                   help="Fixed external camera used for trajectory overlays")
+                   default=["frontview", "sideview", "birdview"],
+                   help="Fixed cameras used for trajectory overlays")
     t.add_argument("--val-k", type=int, default=8)
     t.add_argument("--val-flow-steps", type=int, default=20)
     t.add_argument("--val-cluster-threshold", type=float, default=1.0)

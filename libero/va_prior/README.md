@@ -94,9 +94,10 @@ sample per goal is used to log predicted and target histograms for every action 
 freedom. For each goal the script also restores the demonstration camera and OSC controller,
 starts at the recorded end-effector position, integrates controller-scaled candidate and
 ground-truth XYZ actions, and projects both trajectories onto a freshly rendered fixed-camera
-image. The default `frontview` shows the robot and end effector from across the workspace;
-use `--visualization-camera sideview`, `birdview`, or `agentview` to select another view.
-The PNG files are saved under `OUTPUT/visualizations/epoch_NNNN/` even when W&B is disabled.
+image. By default, `frontview`, `sideview`, and `birdview` are rendered from the same restored
+state. Use, for example, `--visualization-cameras frontview sideview agentview` to choose any
+combination. Per-camera PNG files are saved under `OUTPUT/visualizations/epoch_NNNN/` even
+when W&B is disabled.
 
 GMM and flow heads sample `--visualize-k` stochastic chunks. A deterministic head has only
 one possible chunk and is intentionally plotted once. Visualization uses the raw stochastic
