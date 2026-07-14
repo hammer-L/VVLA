@@ -136,14 +136,16 @@ def training_visualizations(model, raw_batch, goals, args, wandb, output, epoch,
     for index, goal in enumerate(goals):
         figure = None
         try:
-            image = raw_batch["images"][index, -1, 0].numpy()
-            height, width = image.shape[-2:]
+            recorded_image = raw_batch["images"][index, -1, 0].numpy()
+            height, width = recorded_image.shape[-2:]
             key = (raw_batch["dataset_path"][index], raw_batch["demo_id"][index],
-                   int(raw_batch["timestep"][index]))
+                   int(raw_batch["timestep"][index]), args.visualization_camera)
             if key not in geometry_cache:
                 geometry_cache[key] = restore_projection_geometry(
-                    key[0], key[1], key[2], height, width, Path(output) / ".bddl_cache")
+                    key[0], key[1], key[2], height, width, Path(output) / ".bddl_cache",
+                    camera_name=key[3])
             geometry = geometry_cache[key]
+            image = geometry["image"]
             candidate_deltas = scale_controller_actions(candidate_chunks[index], geometry)
             target_deltas = scale_controller_actions(target[index], geometry)
             figure = trajectory_overlay_figure(
@@ -560,6 +562,10 @@ def parser():
     t.add_argument("--visualize-every", type=int, default=5)
     t.add_argument("--visualize-k", type=int, default=8)
     t.add_argument("--visualize-flow-steps", type=int, default=20)
+    t.add_argument("--visualization-camera",
+                   choices=["frontview", "sideview", "birdview", "agentview"],
+                   default="frontview",
+                   help="Fixed external camera used for trajectory overlays")
     t.add_argument("--val-k", type=int, default=8)
     t.add_argument("--val-flow-steps", type=int, default=20)
     t.add_argument("--val-cluster-threshold", type=float, default=1.0)

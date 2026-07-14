@@ -93,7 +93,9 @@ Every `--visualize-every` epochs (and always on the final epoch), one fixed init
 sample per goal is used to log predicted and target histograms for every action degree of
 freedom. For each goal the script also restores the demonstration camera and OSC controller,
 starts at the recorded end-effector position, integrates controller-scaled candidate and
-ground-truth XYZ actions, and projects both trajectories onto the LIBERO `agentview` image.
+ground-truth XYZ actions, and projects both trajectories onto a freshly rendered fixed-camera
+image. The default `frontview` shows the robot and end effector from across the workspace;
+use `--visualization-camera sideview`, `birdview`, or `agentview` to select another view.
 The PNG files are saved under `OUTPUT/visualizations/epoch_NNNN/` even when W&B is disabled.
 
 GMM and flow heads sample `--visualize-k` stochastic chunks. A deterministic head has only

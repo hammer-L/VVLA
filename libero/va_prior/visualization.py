@@ -54,7 +54,7 @@ def project_world_points(points, world_to_camera, image_height, image_width):
 
 def trajectory_overlay_figure(image, candidate_deltas, weights, target_deltas,
                               target_mask, ee_pos, world_to_camera, title=None):
-    """Overlay candidate and ground-truth XYZ trajectories on an agentview image."""
+    """Overlay candidate and ground-truth XYZ trajectories on a camera image."""
     import matplotlib.pyplot as plt
     import matplotlib.patheffects as path_effects
 
@@ -228,8 +228,8 @@ def _resolve_bddl_file(data_group, env_meta, cache_dir, dataset_path=None):
 
 
 def restore_projection_geometry(dataset_path, demo_id, timestep, image_height,
-                                image_width, cache_dir):
-    """Restore one demonstration state and extract camera/controller geometry."""
+                                image_width, cache_dir, camera_name="agentview"):
+    """Restore a demonstration state and render camera/controller geometry."""
     import h5py
     from robosuite.utils import camera_utils
     from libero.libero.envs import TASK_MAPPING
@@ -243,7 +243,7 @@ def restore_projection_geometry(dataset_path, demo_id, timestep, image_height,
         env_kwargs.update({
             "bddl_file_name": str(bddl_file),
             "has_renderer": False,
-            "has_offscreen_renderer": False,
+            "has_offscreen_renderer": True,
             "use_camera_obs": False,
         })
         group = data[demo_id]
@@ -265,15 +265,21 @@ def restore_projection_geometry(dataset_path, demo_id, timestep, image_height,
             env.close()
             warnings.warn(
                 f"Could not restore exact demonstration XML/state ({exc}); "
-                "using the current BDDL environment for fixed agentview geometry")
+                f"using the current BDDL environment for fixed {camera_name} geometry")
             env = make_env()
             env.reset()
         camera = camera_utils.get_camera_transform_matrix(
-            env.sim, "agentview", image_height, image_width)
+            env.sim, camera_name, image_height, image_width)
+        # MuJoCo renders from a bottom-left origin, while images and the camera
+        # projection helper use a top-left origin.
+        image = env.sim.render(
+            camera_name=camera_name, height=image_height, width=image_width)[::-1]
         controller = env.robots[0].controller
         control_dim = int(controller.control_dim)
         controller.scale_action(np.zeros(control_dim, dtype=np.float32))
         geometry = {
+            "image": np.asarray(image),
+            "camera_name": camera_name,
             "world_to_camera": np.asarray(camera),
             "control_dim": control_dim,
             "input_min": np.asarray(controller.input_min),
