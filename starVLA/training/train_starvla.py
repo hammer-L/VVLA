@@ -44,6 +44,7 @@ from transformers import AutoProcessor, get_scheduler
 from starVLA.dataloader import build_dataloader
 from starVLA.model.framework.base_framework import build_framework
 from starVLA.model.framework.share_tools import apply_config_compat
+from starVLA.training.classifier_metrics import binary_classifier_metrics, example_group_metrics
 from starVLA.training.trainer_utils.config_tracker import AccessTrackedConfig, wrap_config
 from starVLA.training.trainer_utils.trainer_tools import TrainerUtils, build_param_lr_groups, setup_optimizer_and_scheduler, normalize_dotlist_args
 
@@ -182,7 +183,16 @@ class VLATrainer(TrainerUtils):
                     project=self.config.wandb_project,
                     entity=self.config.wandb_entity,
                     group="vla-train",
+                    config=OmegaConf.to_container(
+                        self.config.unwrap() if isinstance(self.config, AccessTrackedConfig) else self.config,
+                        resolve=True,
+                    ),
                 )
+                wandb.define_metric("eval/loss", summary="min")
+                wandb.define_metric("eval/auroc", summary="max")
+                wandb.define_metric("eval/average_precision", summary="max")
+                wandb.define_metric("eval/f1", summary="max")
+                wandb.define_metric("eval/paired_accuracy", summary="max")
                 self._wandb_enabled = True
             except Exception as exc:
                 logger.warning(f"W&B init failed; continuing without W&B: {exc}")
@@ -292,7 +302,9 @@ class VLATrainer(TrainerUtils):
     def _log_metrics(self, metrics):
         """Record training metrics."""
         rank = dist.get_rank() if dist.is_initialized() else 0
-        if self.completed_steps % self.config.trainer.logging_frequency == 0 and rank == 0:
+        has_eval_metrics = any(key.startswith("eval/") for key in metrics)
+        should_log = self.completed_steps % self.config.trainer.logging_frequency == 0 or has_eval_metrics
+        if should_log and rank == 0:
             last_lrs = self.lr_scheduler.get_last_lr()
             for i, group in enumerate(self.optimizer.param_groups):
                 group_name = group.get("name", str(i))
@@ -356,10 +368,14 @@ class VLATrainer(TrainerUtils):
                 )
 
             if self.completed_steps % self.config.trainer.eval_interval == 0:
-                step_metrics = self.eval_action_model(step_metrics)
+                if hasattr(self.accelerator.unwrap_model(self.model), "language_classifier"):
+                    step_metrics = self.eval_classifier(step_metrics)
+                else:
+                    step_metrics = self.eval_action_model(step_metrics)
 
             step_metrics["timing/data"] = t_end_data - t_start_data
             step_metrics["timing/model"] = t_end_model - t_start_model
+            step_metrics["train/steps_per_second"] = 1.0 / max(t_end_model - t_start_model, 1e-12)
             self._log_metrics(step_metrics)
 
             if self.completed_steps % self.config.trainer.save_interval == 0 and self.completed_steps > 0:
@@ -390,6 +406,64 @@ class VLATrainer(TrainerUtils):
             dist.barrier()
         return step_metrics
 
+    @torch.inference_mode()
+    def eval_classifier(self, step_metrics: dict = None) -> dict:
+        """Evaluate classifier metrics on the configured evaluation stream.
+
+        The current data API exposes one VLA dataloader, so these metrics use a
+        fresh batch from that stream and are intentionally named ``eval/*``.
+        """
+        examples = self._get_next_batch()
+        model = self.accelerator.unwrap_model(self.model)
+        was_training = model.training
+        model.eval()
+        try:
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                output = model.forward(examples)
+        finally:
+            if was_training:
+                model.train()
+
+        logits = self.accelerator.gather_for_metrics(output["classifier_logits"])
+        labels = self.accelerator.gather_for_metrics(output["classifier_labels"])
+        shuffled = output.get("shuffled_action_logits")
+        if shuffled is not None:
+            shuffled = self.accelerator.gather_for_metrics(shuffled)
+
+        classifier_cfg = model.config.framework.classifier
+        step_metrics.update(
+            binary_classifier_metrics(
+                logits,
+                labels,
+                prefix="eval",
+                threshold=float(classifier_cfg.get("threshold", 0.5)),
+                ece_bins=int(classifier_cfg.get("ece_bins", 10)),
+                shuffled_logits=shuffled,
+            )
+        )
+        # Metadata is local to each rank. Paired and type metrics are therefore
+        # logged on rank 0 only; scalar classification metrics above are global.
+        if self.accelerator.is_main_process:
+            step_metrics.update(
+                example_group_metrics(
+                    output["classifier_logits"],
+                    output["classifier_labels"],
+                    examples,
+                    prefix="eval",
+                    threshold=float(classifier_cfg.get("threshold", 0.5)),
+                    pair_id_key=str(classifier_cfg.get("pair_id_key", "pair_id")),
+                    negative_type_key=str(classifier_cfg.get("negative_type_key", "negative_type")),
+                )
+            )
+            if getattr(self, "_wandb_enabled", False):
+                positive_logits = logits[labels == 1].detach().float().cpu().numpy()
+                negative_logits = logits[labels == 0].detach().float().cpu().numpy()
+                if positive_logits.size:
+                    step_metrics["eval/positive_logit_histogram"] = wandb.Histogram(positive_logits)
+                if negative_logits.size:
+                    step_metrics["eval/negative_logit_histogram"] = wandb.Histogram(negative_logits)
+        return step_metrics
+
     def _log_training_config(self):
         """Record training config."""
         if self.accelerator.is_main_process:
@@ -406,13 +480,32 @@ class VLATrainer(TrainerUtils):
 
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 output_dict = self.model.forward(batch_vla)
-                action_loss = output_dict["action_loss"]
-                total_loss = action_loss
+                if "classifier_loss" in output_dict:
+                    loss_name = "classifier_loss"
+                elif "action_loss" in output_dict:
+                    loss_name = "action_loss"
+                else:
+                    raise KeyError("Model output must contain 'action_loss' or 'classifier_loss'")
+                total_loss = output_dict[loss_name]
 
             self.accelerator.backward(total_loss)
 
+            unwrapped_model = self.accelerator.unwrap_model(self.model)
+            classifier = getattr(unwrapped_model, "language_classifier", None)
+            if classifier is not None:
+                classifier_grad_norm = self._gradient_norm(classifier.parameters())
+                action_encoder_grad_norm = self._gradient_norm(classifier.action_encoder.parameters())
+                vl_projector_grad_norm = self._gradient_norm(classifier.vl_projector.parameters())
+                vlm_grad_norm = self._gradient_norm(unwrapped_model.qwen_vl_interface.parameters())
+            else:
+                classifier_grad_norm = action_encoder_grad_norm = vl_projector_grad_norm = vlm_grad_norm = None
+
             if self.config.trainer.gradient_clipping is not None:
-                self.accelerator.clip_grad_norm_(self.model.parameters(), self.config.trainer.gradient_clipping)
+                total_grad_norm = self.accelerator.clip_grad_norm_(
+                    self.model.parameters(), self.config.trainer.gradient_clipping
+                )
+            else:
+                total_grad_norm = self._gradient_norm(self.model.parameters())
 
             self.optimizer.step()
             # Only step the LR scheduler when gradients are actually synced
@@ -423,9 +516,48 @@ class VLATrainer(TrainerUtils):
             if self.accelerator.sync_gradients:
                 self.lr_scheduler.step()
 
-        return {
-            "action_dit_loss": action_loss.item(),
+        logged_loss_name = "action_dit_loss" if loss_name == "action_loss" else loss_name
+        metrics = {
+            logged_loss_name: total_loss.item(),
+            "train/grad_norm": float(total_grad_norm),
         }
+        if "classifier_logits" in output_dict:
+            logits = self.accelerator.gather_for_metrics(output_dict["classifier_logits"])
+            labels = self.accelerator.gather_for_metrics(output_dict["classifier_labels"])
+            shuffled = output_dict.get("shuffled_action_logits")
+            if shuffled is not None:
+                shuffled = self.accelerator.gather_for_metrics(shuffled)
+            classifier_cfg = self.accelerator.unwrap_model(self.model).config.framework.classifier
+            metrics.update(
+                binary_classifier_metrics(
+                    logits,
+                    labels,
+                    prefix="train",
+                    threshold=float(classifier_cfg.get("threshold", 0.5)),
+                    ece_bins=int(classifier_cfg.get("ece_bins", 10)),
+                    shuffled_logits=shuffled,
+                )
+            )
+            metrics.update(
+                {
+                    "train/grad_norm_classifier": classifier_grad_norm,
+                    "train/grad_norm_action_encoder": action_encoder_grad_norm,
+                    "train/grad_norm_vl_projector": vl_projector_grad_norm,
+                    "train/grad_norm_vlm": vlm_grad_norm,
+                }
+            )
+        if torch.cuda.is_available():
+            metrics["system/gpu_memory_allocated_gb"] = torch.cuda.max_memory_allocated() / 1024**3
+            metrics["system/gpu_memory_reserved_gb"] = torch.cuda.max_memory_reserved() / 1024**3
+        return metrics
+
+    @staticmethod
+    def _gradient_norm(parameters) -> float:
+        squared_norm = 0.0
+        for parameter in parameters:
+            if parameter.grad is not None:
+                squared_norm += float(parameter.grad.detach().float().norm(2)) ** 2
+        return squared_norm**0.5
 
     def _finalize_training(self):
         """Training end processing."""

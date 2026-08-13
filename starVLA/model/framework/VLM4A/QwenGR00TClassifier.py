@@ -1,0 +1,146 @@
+"""Qwen-GR00T with an auxiliary language-action compatibility classifier."""
+
+from dataclasses import dataclass, field
+from typing import List, Optional
+
+import numpy as np
+import torch
+
+from starVLA.model.framework.VLM4A.QwenGR00T import QwenGR00TDefaultConfig, Qwen_GR00T
+from starVLA.model.framework.share_tools import merge_framework_config
+from starVLA.model.modules.language_action_classifier import LanguageActionClassifier
+from starVLA.model.tools import FRAMEWORK_REGISTRY
+
+
+@dataclass
+class QwenGR00TClassifierDefaultConfig(QwenGR00TDefaultConfig):
+    """Defaults for the pooled VLM + flattened action baseline."""
+
+    name: str = "QwenGR00TClassifier"
+    classifier: dict = field(
+        default_factory=lambda: {
+            "hidden_dim": 512,
+            "dropout": 0.1,
+            "label_key": "classifier_label",
+            "pos_weight": None,
+            "threshold": 0.5,
+            "ece_bins": 10,
+            "pair_id_key": "pair_id",
+            "negative_type_key": "negative_type",
+        }
+    )
+
+
+@FRAMEWORK_REGISTRY.register("QwenGR00TClassifier")
+class Qwen_GR00T_Classifier(Qwen_GR00T):
+    """Reuse QwenGR00T weights and add a binary compatibility-scoring branch."""
+
+    def __init__(self, config: Optional[dict] = None, **kwargs) -> None:
+        # Merge classifier defaults first. Qwen_GR00T will merge its own defaults
+        # again without removing the extra classifier configuration.
+        config = merge_framework_config(QwenGR00TClassifierDefaultConfig, config)
+        super().__init__(config=config, **kwargs)
+
+        classifier_cfg = self.config.framework.classifier
+        self.language_classifier = LanguageActionClassifier(
+            vlm_hidden_dim=int(self.qwen_vl_interface.model.config.hidden_size),
+            action_horizon=self.action_horizon,
+            action_dim=int(self.config.framework.action_model.action_dim),
+            hidden_dim=int(classifier_cfg.hidden_dim),
+            dropout=float(classifier_cfg.dropout),
+        )
+
+    def _encode_examples(self, examples: List[dict]):
+        batch_images = [example["image"] for example in examples]
+        instructions = [example["lang"] for example in examples]
+        qwen_inputs = self.qwen_vl_interface.build_qwenvl_inputs(
+            images=batch_images,
+            instructions=instructions,
+        )
+        attention_mask = qwen_inputs.get("attention_mask")
+        outputs = self.qwen_vl_interface(
+            **qwen_inputs,
+            output_attentions=False,
+            output_hidden_states=True,
+            return_dict=True,
+        )
+        return outputs.hidden_states[-1], attention_mask
+
+    def _actions_from_examples(self, examples: List[dict], reference: torch.Tensor) -> torch.Tensor:
+        actions = torch.as_tensor(
+            np.asarray([example["action"] for example in examples]),
+            device=reference.device,
+            dtype=reference.dtype,
+        )
+        if actions.ndim != 3:
+            raise ValueError(f"example['action'] must form [B, T, A], got {tuple(actions.shape)}")
+        if actions.shape[1] < self.action_horizon:
+            raise ValueError(
+                f"Action chunk has {actions.shape[1]} steps, but action_horizon={self.action_horizon}"
+            )
+        return actions[:, -self.action_horizon :, :]
+
+    def score_actions(
+        self,
+        last_hidden: torch.Tensor,
+        actions: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Return differentiable compatibility logits for candidate actions."""
+        return self.language_classifier(last_hidden, actions, attention_mask)
+
+    def forward(self, examples: List[dict] = None, **kwargs) -> dict:
+        if not examples:
+            raise ValueError("examples must be a non-empty list")
+
+        last_hidden, attention_mask = self._encode_examples(examples)
+        actions = self._actions_from_examples(examples, last_hidden)
+        logits = self.score_actions(last_hidden, actions, attention_mask)
+
+        label_key = str(self.config.framework.classifier.label_key)
+        missing = [index for index, example in enumerate(examples) if label_key not in example]
+        if missing:
+            raise KeyError(f"Missing classifier label key {label_key!r} in examples at indices {missing}")
+        labels = torch.as_tensor(
+            [example[label_key] for example in examples],
+            device=logits.device,
+            dtype=logits.dtype,
+        ).reshape(-1)
+        if not torch.all((labels == 0) | (labels == 1)):
+            raise ValueError(f"{label_key!r} values must be binary (0 or 1)")
+
+        loss = self.language_classifier.loss(
+            logits,
+            labels,
+            pos_weight=self.config.framework.classifier.get("pos_weight", None),
+        )
+        with torch.no_grad():
+            shuffled_logits = None
+            if actions.shape[0] > 1:
+                shuffled_logits = self.score_actions(last_hidden, actions.roll(1, dims=0), attention_mask)
+        return {
+            "classifier_loss": loss,
+            "classifier_logits": logits.detach(),
+            "classifier_labels": labels.detach(),
+            "shuffled_action_logits": None if shuffled_logits is None else shuffled_logits.detach(),
+        }
+
+    def compute_loss(self, tag: str, batch, loss_scale: dict | None = None) -> dict | None:
+        """Expose only the loss tensor to generic multi-dataloader trainers."""
+        if tag != "vla":
+            return super().compute_loss(tag, batch, loss_scale)
+        scale = (loss_scale or {}).get(tag, 1.0)
+        return {"classifier_loss": self.forward(batch)["classifier_loss"] * scale}
+
+    @torch.inference_mode()
+    def predict_compatibility(self, examples: List[dict]) -> dict:
+        """Return logits and probabilities for already-normalized action chunks."""
+        if not examples:
+            raise ValueError("examples must be a non-empty list")
+        last_hidden, attention_mask = self._encode_examples(examples)
+        actions = self._actions_from_examples(examples, last_hidden)
+        logits = self.score_actions(last_hidden, actions, attention_mask)
+        return {
+            "compatibility_logits": logits.detach().cpu().numpy(),
+            "compatibility_scores": logits.sigmoid().detach().cpu().numpy(),
+        }
