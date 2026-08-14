@@ -14,6 +14,7 @@ Conventions:
 import argparse
 import json
 import os
+import subprocess
 import time
 from pathlib import Path
 from typing import Tuple
@@ -44,7 +45,12 @@ from transformers import AutoProcessor, get_scheduler
 from starVLA.dataloader import build_dataloader
 from starVLA.model.framework.base_framework import build_framework
 from starVLA.model.framework.share_tools import apply_config_compat
-from starVLA.training.classifier_metrics import binary_classifier_metrics, example_group_metrics
+from starVLA.training.classifier_metrics import (
+    binary_classifier_metrics,
+    classifier_record_report,
+    classifier_records_from_batch,
+    gather_classifier_records,
+)
 from starVLA.training.trainer_utils.config_tracker import AccessTrackedConfig, wrap_config
 from starVLA.training.trainer_utils.trainer_tools import TrainerUtils, build_param_lr_groups, setup_optimizer_and_scheduler, normalize_dotlist_args
 
@@ -75,15 +81,30 @@ def setup_directories(cfg) -> Path:
     return output_dir
 
 
-def prepare_data(cfg, accelerator, output_dir) -> DataLoader:
+def prepare_data(cfg, accelerator, output_dir) -> tuple[DataLoader, DataLoader | None, DataLoader | None]:
     """Prepare VLA training data."""
     logger.info(f"Creating VLA Dataset with Mixture `{cfg.datasets.vla_data.data_mix}`")
     vla_train_dataloader = build_dataloader(cfg=cfg, dataset_py=cfg.datasets.vla_data.dataset_py)
+    vla_val_dataloader = None
+    vla_test_dataloader = None
+    if cfg.datasets.vla_data.get("language_overlay_meta", None):
+        vla_val_dataloader = build_dataloader(
+            cfg=cfg,
+            dataset_py=cfg.datasets.vla_data.dataset_py,
+            overlay_split="val",
+            overlay_mode="exhaustive_eval",
+        )
+        vla_test_dataloader = build_dataloader(
+            cfg=cfg,
+            dataset_py=cfg.datasets.vla_data.dataset_py,
+            overlay_split="test",
+            overlay_mode="exhaustive_eval",
+        )
 
     accelerator.dataloader_config.dispatch_batches = False
     if dist.is_initialized():
         dist.barrier()
-    return vla_train_dataloader
+    return vla_train_dataloader, vla_val_dataloader, vla_test_dataloader
 
 
 def setup_optimizer_and_scheduler(model, cfg) -> Tuple[torch.optim.Optimizer, torch.optim.lr_scheduler._LRScheduler]:
@@ -116,16 +137,31 @@ def setup_optimizer_and_scheduler(model, cfg) -> Tuple[torch.optim.Optimizer, to
 
 
 class VLATrainer(TrainerUtils):
-    def __init__(self, cfg, model, vla_train_dataloader, optimizer, lr_scheduler, accelerator):
+    def __init__(
+        self,
+        cfg,
+        model,
+        vla_train_dataloader,
+        optimizer,
+        lr_scheduler,
+        accelerator,
+        vla_val_dataloader=None,
+        vla_test_dataloader=None,
+    ):
         self.config = cfg
         self.model = model
         self.vla_train_dataloader = vla_train_dataloader
+        self.vla_val_dataloader = vla_val_dataloader
+        self.vla_test_dataloader = vla_test_dataloader
         self.optimizer = optimizer
         self.lr_scheduler = lr_scheduler
         self.accelerator = accelerator
 
         self.completed_steps = 0
         self.total_batch_size = self._calculate_total_batch_size()
+        self.best_classifier_score = None
+        self.best_classifier_checkpoint = None
+        self.classifier_threshold = None
 
     def prepare_training(self):
         rank = dist.get_rank() if dist.is_initialized() else 0
@@ -148,12 +184,19 @@ class VLATrainer(TrainerUtils):
         self.model = self.freeze_backbones(self.model, freeze_modules=freeze_modules)
         self.print_trainable_parameters(self.model)
 
-        self.model, self.optimizer, self.vla_train_dataloader = self.setup_distributed_training(
-            self.accelerator,
-            self.model,
-            self.optimizer,
-            self.vla_train_dataloader,
-        )
+        components = [self.model, self.optimizer, self.vla_train_dataloader]
+        if self.vla_val_dataloader is not None:
+            components.append(self.vla_val_dataloader)
+        if self.vla_test_dataloader is not None:
+            components.append(self.vla_test_dataloader)
+        prepared = self.setup_distributed_training(self.accelerator, *components)
+        self.model, self.optimizer, self.vla_train_dataloader = prepared[:3]
+        offset = 3
+        if self.vla_val_dataloader is not None:
+            self.vla_val_dataloader = prepared[offset]
+            offset += 1
+        if self.vla_test_dataloader is not None:
+            self.vla_test_dataloader = prepared[offset]
 
         self._init_wandb()
 
@@ -367,7 +410,11 @@ class VLATrainer(TrainerUtils):
                     }
                 )
 
-            if self.completed_steps % self.config.trainer.eval_interval == 0:
+            if (
+                self.accelerator.sync_gradients
+                and self.completed_steps > 0
+                and self.completed_steps % self.config.trainer.eval_interval == 0
+            ):
                 if hasattr(self.accelerator.unwrap_model(self.model), "language_classifier"):
                     step_metrics = self.eval_classifier(step_metrics)
                 else:
@@ -384,7 +431,34 @@ class VLATrainer(TrainerUtils):
             if self.completed_steps >= self.config.trainer.max_train_steps:
                 break
 
+        if hasattr(self.accelerator.unwrap_model(self.model), "language_classifier"):
+            if self.vla_val_dataloader is not None and not (Path(self.checkpoint_dir) / "best_classifier.json").exists():
+                self.eval_classifier({})
+        if (
+            hasattr(self.accelerator.unwrap_model(self.model), "language_classifier")
+            and self.vla_test_dataloader is not None
+        ):
+            self._evaluate_selected_classifier_test()
         self._finalize_training()
+
+    def _evaluate_selected_classifier_test(self) -> None:
+        """Load the selected validation checkpoint and evaluate test exactly once."""
+        self.accelerator.wait_for_everyone()
+        selection_path = Path(self.checkpoint_dir) / "best_classifier.json"
+        if not selection_path.exists():
+            raise RuntimeError("classifier test requested but no validation-selected checkpoint exists")
+        selection = json.loads(selection_path.read_text(encoding="utf-8"))
+        checkpoint = selection["checkpoint"]
+        state_dict = torch.load(checkpoint, map_location="cpu", weights_only=True)
+        self.accelerator.unwrap_model(self.model).load_state_dict(state_dict)
+        self.best_classifier_checkpoint = checkpoint
+        self.classifier_threshold = float(selection["threshold"])
+        self._evaluate_classifier_loader(
+            self.vla_test_dataloader,
+            prefix="test",
+            threshold=self.classifier_threshold,
+            select_checkpoint=False,
+        )
 
     def eval_action_model(self, step_metrics: dict = None) -> float:
         """Run simple action-eval on current batch and attach score to metrics."""
@@ -408,61 +482,140 @@ class VLATrainer(TrainerUtils):
 
     @torch.inference_mode()
     def eval_classifier(self, step_metrics: dict = None) -> dict:
-        """Evaluate classifier metrics on the configured evaluation stream.
+        """Traverse the complete, independent exhaustive validation split."""
+        if self.vla_val_dataloader is None:
+            raise RuntimeError("classifier evaluation requires an independent validation dataloader")
+        return self._evaluate_classifier_loader(
+            self.vla_val_dataloader,
+            prefix="eval",
+            step_metrics=step_metrics,
+            threshold=None,
+            select_checkpoint=True,
+        )
 
-        The current data API exposes one VLA dataloader, so these metrics use a
-        fresh batch from that stream and are intentionally named ``eval/*``.
-        """
-        examples = self._get_next_batch()
+    @torch.inference_mode()
+    def _evaluate_classifier_loader(
+        self,
+        dataloader,
+        *,
+        prefix: str,
+        step_metrics: dict | None = None,
+        threshold: float | None,
+        select_checkpoint: bool,
+    ) -> dict:
+        """Evaluate all local batches, then object-gather/deduplicate on rank 0."""
         model = self.accelerator.unwrap_model(self.model)
         was_training = model.training
         model.eval()
+        local_records = []
         try:
-            with torch.autocast("cuda", dtype=torch.bfloat16):
-                output = model.forward(examples)
+            for examples in dataloader:
+                device_type = "cuda" if torch.cuda.is_available() else "cpu"
+                with torch.autocast(device_type, dtype=torch.bfloat16, enabled=torch.cuda.is_available()):
+                    output = model.forward(examples)
+                local_records.extend(
+                    classifier_records_from_batch(
+                        output["classifier_logits"],
+                        output["classifier_labels"],
+                        examples,
+                    )
+                )
         finally:
             if was_training:
                 model.train()
-
-        logits = self.accelerator.gather_for_metrics(output["classifier_logits"])
-        labels = self.accelerator.gather_for_metrics(output["classifier_labels"])
-        shuffled = output.get("shuffled_action_logits")
-        if shuffled is not None:
-            shuffled = self.accelerator.gather_for_metrics(shuffled)
-
-        classifier_cfg = model.config.framework.classifier
-        step_metrics.update(
-            binary_classifier_metrics(
-                logits,
-                labels,
-                prefix="eval",
-                threshold=float(classifier_cfg.get("threshold", 0.5)),
-                ece_bins=int(classifier_cfg.get("ece_bins", 10)),
-                shuffled_logits=shuffled,
-            )
-        )
-        # Metadata is local to each rank. Paired and type metrics are therefore
-        # logged on rank 0 only; scalar classification metrics above are global.
+        records = gather_classifier_records(local_records)
+        result = dict(step_metrics or {})
+        report = None
+        report_path = Path(self.config.output_dir) / f"{prefix}_classifier_report_step_{self.completed_steps}.json"
+        should_save_best = False
         if self.accelerator.is_main_process:
-            step_metrics.update(
-                example_group_metrics(
-                    output["classifier_logits"],
-                    output["classifier_labels"],
-                    examples,
-                    prefix="eval",
-                    threshold=float(classifier_cfg.get("threshold", 0.5)),
-                    pair_id_key=str(classifier_cfg.get("pair_id_key", "pair_id")),
-                    negative_type_key=str(classifier_cfg.get("negative_type_key", "negative_type")),
-                )
+            bootstrap_samples = int(model.config.framework.classifier.get("bootstrap_samples", 10_000))
+            report = classifier_record_report(
+                records,
+                prefix=prefix,
+                threshold=threshold,
+                bootstrap_samples=bootstrap_samples,
+                seed=int(getattr(self.config, "seed", 42)),
             )
-            if getattr(self, "_wandb_enabled", False):
-                positive_logits = logits[labels == 1].detach().float().cpu().numpy()
-                negative_logits = logits[labels == 0].detach().float().cpu().numpy()
-                if positive_logits.size:
-                    step_metrics["eval/positive_logit_histogram"] = wandb.Histogram(positive_logits)
-                if negative_logits.size:
-                    step_metrics["eval/negative_logit_histogram"] = wandb.Histogram(negative_logits)
-        return step_metrics
+            report.update(self._evaluation_provenance(dataloader, prefix))
+            result.update(report["metrics"])
+            if prefix == "eval":
+                self.classifier_threshold = float(report["threshold"])
+            if select_checkpoint:
+                score = self._classifier_checkpoint_score(report)
+                should_save_best = self.best_classifier_score is None or score > self.best_classifier_score
+                if should_save_best:
+                    self.best_classifier_score = score
+        decision = [should_save_best]
+        if dist.is_initialized():
+            dist.broadcast_object_list(decision, src=0)
+        if select_checkpoint and decision[0]:
+            # DeepSpeed/ZeRO state consolidation may itself be collective, so
+            # every rank participates even though only rank zero writes.
+            state_dict = self.accelerator.get_state_dict(self.model)
+            if self.accelerator.is_main_process:
+                self._save_best_classifier(report, report_path, state_dict)
+        if self.accelerator.is_main_process:
+            if select_checkpoint:
+                report["checkpoint"] = self.best_classifier_checkpoint
+            with report_path.open("w", encoding="utf-8") as handle:
+                json.dump(report, handle, indent=2, sort_keys=True)
+                handle.write("\n")
+        self.accelerator.wait_for_everyone()
+        return result
+
+    def _evaluation_provenance(self, dataloader, prefix: str) -> dict:
+        dataset = getattr(dataloader, "dataset", None)
+        while dataset is not None and not hasattr(dataset, "meta_digest") and hasattr(dataset, "dataset"):
+            dataset = dataset.dataset
+        try:
+            git_commit = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=Path(__file__).resolve().parents[2], text=True
+            ).strip()
+        except Exception:
+            git_commit = None
+        meta_dir = self.config.datasets.vla_data.get("language_overlay_meta", None)
+        quarantine_count = 0
+        if meta_dir:
+            quarantine_path = Path(str(meta_dir)) / "quarantine.jsonl"
+            if quarantine_path.exists():
+                with quarantine_path.open(encoding="utf-8") as handle:
+                    quarantine_count = sum(1 for line in handle if line.strip())
+        return {
+            "split": prefix,
+            "step": self.completed_steps,
+            "checkpoint": self.best_classifier_checkpoint,
+            "meta_digest": getattr(dataset, "meta_digest", None),
+            "quarantine_count": quarantine_count,
+            "git_commit": git_commit,
+        }
+
+    @staticmethod
+    def _classifier_checkpoint_score(report: dict) -> tuple[float, float, float]:
+        metrics = report["metrics"]
+        return (
+            float(metrics.get("eval/auroc", float("-inf"))),
+            float(metrics.get("eval/average_precision", float("-inf"))),
+            -float(metrics.get("eval/loss", float("inf"))),
+        )
+
+    def _save_best_classifier(self, report: dict, report_path: Path, state_dict: dict) -> None:
+        score = self._classifier_checkpoint_score(report)
+        checkpoint = Path(self.checkpoint_dir) / "best_classifier_pytorch_model.pt"
+        torch.save(state_dict, checkpoint)
+        selection = {
+            "step": self.completed_steps,
+            "score": {"auroc": score[0], "average_precision": score[1], "loss": -score[2]},
+            "threshold": report["threshold"],
+            "threshold_source": report["threshold_source"],
+            "report": str(report_path),
+            "checkpoint": str(checkpoint),
+        }
+        selection_path = Path(self.checkpoint_dir) / "best_classifier.json"
+        with selection_path.open("w", encoding="utf-8") as handle:
+            json.dump(selection, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+        self.best_classifier_checkpoint = str(checkpoint)
 
     def _log_training_config(self):
         """Record training config."""
@@ -591,9 +744,17 @@ def main(cfg) -> None:
     cfg = wrap_config(cfg)
     logger.info("✅ Configuration wrapped for access tracking")
 
+    overlay_meta = cfg.datasets.vla_data.get("language_overlay_meta", None)
+    if overlay_meta:
+        from starVLA.dataloader.language_overlay import validate_language_overlay_metadata
+
+        validate_language_overlay_metadata(overlay_meta)
+
     output_dir = setup_directories(cfg=cfg)
     vla = build_framework(cfg)
-    vla_train_dataloader = prepare_data(cfg=cfg, accelerator=accelerator, output_dir=output_dir)
+    vla_train_dataloader, vla_val_dataloader, vla_test_dataloader = prepare_data(
+        cfg=cfg, accelerator=accelerator, output_dir=output_dir
+    )
     optimizer, lr_scheduler = setup_optimizer_and_scheduler(model=vla, cfg=cfg)
 
     trainer = VLATrainer(
@@ -603,6 +764,8 @@ def main(cfg) -> None:
         optimizer=optimizer,
         lr_scheduler=lr_scheduler,
         accelerator=accelerator,
+        vla_val_dataloader=vla_val_dataloader,
+        vla_test_dataloader=vla_test_dataloader,
     )
 
     trainer.prepare_training()

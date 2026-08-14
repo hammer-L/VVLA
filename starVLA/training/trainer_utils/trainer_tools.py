@@ -341,6 +341,12 @@ class TrainerUtils:
         if hasattr(dataloader, "sampler") and callable(getattr(dataloader.sampler, "set_epoch", None)):
             dataloader.sampler.set_epoch(epoch_counter)
 
+        # Dataset-level epoch state drives deterministic language-overlay
+        # label/variant rotation and must advance even without a sampler.
+        dataset = getattr(dataloader, "dataset", None)
+        if dataset is not None and callable(getattr(dataset, "set_epoch", None)):
+            dataset.set_epoch(epoch_counter)
+
         # 3. create new iterator
         return iter(dataloader), epoch_counter
 

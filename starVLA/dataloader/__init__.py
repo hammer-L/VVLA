@@ -33,7 +33,13 @@ def save_dataset_statistics(dataset_statistics, run_dir):
 
 
 
-def build_dataloader(cfg, dataset_py="lerobot_datasets_oxe"): # TODO now here only is get dataset, we need mv dataloader to here
+def build_dataloader(
+    cfg,
+    dataset_py="lerobot_datasets_oxe",
+    *,
+    overlay_split=None,
+    overlay_mode=None,
+): # TODO now here only is get dataset, we need mv dataloader to here
 
     if dataset_py == "lerobot_datasets":
         from starVLA.dataloader.lerobot_datasets import get_vla_dataset, collate_fn
@@ -44,6 +50,13 @@ def build_dataloader(cfg, dataset_py="lerobot_datasets_oxe"): # TODO now here on
             balance_dataset_weights=vla_dataset_cfg.get("balance_dataset_weights", False),
             balance_trajectory_weights=vla_dataset_cfg.get("balance_trajectory_weights", False),
         )
+        from starVLA.dataloader.language_overlay import wrap_language_overlay
+        vla_dataset = wrap_language_overlay(
+            vla_dataset,
+            vla_dataset_cfg,
+            split=overlay_split,
+            mode=overlay_mode,
+        )
         num_workers = int(vla_dataset_cfg.get("num_workers", 4))
         dataloader_kwargs = {
             "batch_size": cfg.datasets.vla_data.per_device_batch_size,
@@ -53,7 +66,10 @@ def build_dataloader(cfg, dataset_py="lerobot_datasets_oxe"): # TODO now here on
             # shuffle=True
         }
         if num_workers > 0:
-            dataloader_kwargs["persistent_workers"] = bool(vla_dataset_cfg.get("persistent_workers", True))
+            # Overlay epoch rotation lives in dataset state. Non-persistent
+            # workers are recreated after set_epoch and observe that state.
+            overlay_enabled = bool(vla_dataset_cfg.get("language_overlay_meta", None))
+            dataloader_kwargs["persistent_workers"] = False if overlay_enabled else bool(vla_dataset_cfg.get("persistent_workers", True))
             dataloader_kwargs["prefetch_factor"] = int(vla_dataset_cfg.get("prefetch_factor", 2))
 
         vla_train_dataloader = DataLoader(

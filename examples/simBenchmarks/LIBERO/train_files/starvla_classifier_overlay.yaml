@@ -1,0 +1,61 @@
+run_id: libero-language-classifier
+run_root_dir: playground/Checkpoints
+seed: 42
+wandb_entity: null
+wandb_project: libero-language-compatibility
+is_debug: false
+version_id: "0.21"
+
+framework:
+  name: QwenGR00TClassifier
+  qwenvl:
+    base_vlm: ./playground/Pretrained_models/Qwen3-VL-4B-Instruct
+    attn_implementation: flash_attention_2
+    vl_hidden_dim: 2048
+  action_model:
+    action_dim: 7
+    state_dim: 7
+    action_horizon: 8
+  classifier:
+    hidden_dim: 512
+    dropout: 0.1
+    threshold: 0.5
+    ece_bins: 10
+    bootstrap_samples: 10000
+    freeze_backbones: true
+
+datasets:
+  vla_data:
+    dataset_py: lerobot_datasets
+    data_root_dir: /home/happigo/vla_ws/dataset/libero
+    data_mix: libero_all
+    per_device_batch_size: 16
+    video_backend: torchvision_av
+    num_workers: 4
+    language_overlay_meta: /home/happigo/vla_ws/dataset/libero/VA+L实验设计方案/benchmark/meta
+    language_overlay_split: train
+    language_overlay_mode: balanced_train
+
+trainer:
+  max_train_steps: 10000
+  num_warmup_steps: 500
+  save_interval: 1000
+  eval_interval: 250
+  # Baseline: freeze the VLM and original action model; train only language_classifier.
+  freeze_modules: "qwen_vl_interface,action_model"
+  learning_rate:
+    base: 1.0e-04
+    language_classifier: 1.0e-04
+  lr_scheduler_type: cosine_with_min_lr
+  scheduler_specific_kwargs:
+    min_lr: 1.0e-06
+  loss_scale:
+    vla: 1.0
+  gradient_clipping: 1.0
+  gradient_accumulation_steps: 1
+  logging_frequency: 10
+  optimizer:
+    name: AdamW
+    betas: [0.9, 0.95]
+    eps: 1.0e-08
+    weight_decay: 1.0e-08

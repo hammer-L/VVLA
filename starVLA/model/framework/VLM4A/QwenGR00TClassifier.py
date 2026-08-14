@@ -27,6 +27,8 @@ class QwenGR00TClassifierDefaultConfig(QwenGR00TDefaultConfig):
             "ece_bins": 10,
             "pair_id_key": "pair_id",
             "negative_type_key": "negative_type",
+            "bootstrap_samples": 10000,
+            "freeze_backbones": True,
         }
     )
 
@@ -42,13 +44,23 @@ class Qwen_GR00T_Classifier(Qwen_GR00T):
         super().__init__(config=config, **kwargs)
 
         classifier_cfg = self.config.framework.classifier
+        action_dim = int(self.config.framework.action_model.action_dim)
+        if self.action_horizon != 8 or action_dim != 7:
+            raise ValueError(
+                "QwenGR00TClassifier LIBERO baseline requires action shape [8, 7], "
+                f"got [{self.action_horizon}, {action_dim}]"
+            )
         self.language_classifier = LanguageActionClassifier(
             vlm_hidden_dim=int(self.qwen_vl_interface.model.config.hidden_size),
             action_horizon=self.action_horizon,
-            action_dim=int(self.config.framework.action_model.action_dim),
+            action_dim=action_dim,
             hidden_dim=int(classifier_cfg.hidden_dim),
             dropout=float(classifier_cfg.dropout),
         )
+        if bool(classifier_cfg.get("freeze_backbones", True)):
+            for module in (self.qwen_vl_interface, self.action_model):
+                for parameter in module.parameters():
+                    parameter.requires_grad = False
 
     def _encode_examples(self, examples: List[dict]):
         batch_images = [example["image"] for example in examples]
