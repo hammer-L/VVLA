@@ -1,4 +1,4 @@
-run_id: libero-action-aware-classifier-v2
+run_id: libero-language-classifier
 run_root_dir: playground/Checkpoints
 seed: 42
 wandb_entity: null
@@ -23,21 +23,18 @@ framework:
     ece_bins: 10
     bootstrap_samples: 10000
     freeze_backbones: true
-    pos_weight: 2.0
-    protocol_version: "2.0.0"
 
 datasets:
   vla_data:
     dataset_py: lerobot_datasets
-    data_root_dir: /home/happigo/vla_ws/dataset/libero
+    data_root_dir: /root/gpufree-data/liumingyu/datasets/libero
     data_mix: libero_all
-    # Must be divisible by three so contrastive triplets stay intact.
-    per_device_batch_size: 15
+    per_device_batch_size: 16
     video_backend: torchvision_av
     num_workers: 4
-    language_overlay_meta: /home/happigo/vla_ws/dataset/libero/VA+L实验设计方案/benchmark/meta
+    language_overlay_meta: /root/gpufree-data/liumingyu/datasets/libero/benchmark/meta
     language_overlay_split: train
-    language_overlay_mode: contrastive_train
+    language_overlay_mode: balanced_train
 
 trainer:
   max_train_steps: 10000
