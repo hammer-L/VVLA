@@ -48,6 +48,7 @@ from starVLA.model.framework.share_tools import apply_config_compat
 from starVLA.training.classifier_metrics import (
     binary_classifier_metrics,
     classifier_record_report,
+    classifier_checkpoint_score,
     classifier_records_from_batch,
     gather_classifier_records,
 )
@@ -236,6 +237,8 @@ class VLATrainer(TrainerUtils):
                 wandb.define_metric("eval/average_precision", summary="max")
                 wandb.define_metric("eval/f1", summary="max")
                 wandb.define_metric("eval/paired_accuracy", summary="max")
+                wandb.define_metric("eval/language_paired_accuracy", summary="max")
+                wandb.define_metric("eval/action_paired_accuracy", summary="max")
                 self._wandb_enabled = True
             except Exception as exc:
                 logger.warning(f"W&B init failed; continuing without W&B: {exc}")
@@ -448,6 +451,8 @@ class VLATrainer(TrainerUtils):
         if not selection_path.exists():
             raise RuntimeError("classifier test requested but no validation-selected checkpoint exists")
         selection = json.loads(selection_path.read_text(encoding="utf-8"))
+        if selection.get("protocol_version") != "2.0.0":
+            raise RuntimeError("refusing protocol-v1 classifier checkpoint; retrain with v2 metadata")
         checkpoint = selection["checkpoint"]
         state_dict = torch.load(checkpoint, map_location="cpu", weights_only=True)
         self.accelerator.unwrap_model(self.model).load_state_dict(state_dict)
@@ -518,6 +523,10 @@ class VLATrainer(TrainerUtils):
                         output["classifier_logits"],
                         output["classifier_labels"],
                         examples,
+                        vl_probe_logits=output["vl_probe_logits"],
+                        action_probe_logits=output["action_probe_logits"],
+                        donor_action_logits=output["donor_action_logits"],
+                        mean_action_logits=output["mean_action_logits"],
                     )
                 )
         finally:
@@ -591,21 +600,22 @@ class VLATrainer(TrainerUtils):
         }
 
     @staticmethod
-    def _classifier_checkpoint_score(report: dict) -> tuple[float, float, float]:
-        metrics = report["metrics"]
-        return (
-            float(metrics.get("eval/auroc", float("-inf"))),
-            float(metrics.get("eval/average_precision", float("-inf"))),
-            -float(metrics.get("eval/loss", float("inf"))),
-        )
+    def _classifier_checkpoint_score(report: dict) -> tuple[float, float, float, float]:
+        return classifier_checkpoint_score(report, prefix="eval")
 
     def _save_best_classifier(self, report: dict, report_path: Path, state_dict: dict) -> None:
         score = self._classifier_checkpoint_score(report)
         checkpoint = Path(self.checkpoint_dir) / "best_classifier_pytorch_model.pt"
         torch.save(state_dict, checkpoint)
         selection = {
+            "protocol_version": "2.0.0",
             "step": self.completed_steps,
-            "score": {"auroc": score[0], "average_precision": score[1], "loss": -score[2]},
+            "score": {
+                "minimum_paired_accuracy": score[0],
+                "paired_harmonic_mean": score[1],
+                "joint_auroc": score[2],
+                "loss": -score[3],
+            },
             "threshold": report["threshold"],
             "threshold_source": report["threshold_source"],
             "report": str(report_path),
@@ -677,9 +687,6 @@ class VLATrainer(TrainerUtils):
         if "classifier_logits" in output_dict:
             logits = self.accelerator.gather_for_metrics(output_dict["classifier_logits"])
             labels = self.accelerator.gather_for_metrics(output_dict["classifier_labels"])
-            shuffled = output_dict.get("shuffled_action_logits")
-            if shuffled is not None:
-                shuffled = self.accelerator.gather_for_metrics(shuffled)
             classifier_cfg = self.accelerator.unwrap_model(self.model).config.framework.classifier
             metrics.update(
                 binary_classifier_metrics(
@@ -688,9 +695,14 @@ class VLATrainer(TrainerUtils):
                     prefix="train",
                     threshold=float(classifier_cfg.get("threshold", 0.5)),
                     ece_bins=int(classifier_cfg.get("ece_bins", 10)),
-                    shuffled_logits=shuffled,
                 )
             )
+            for key in (
+                "classifier_bce_loss", "classifier_language_rank_loss", "classifier_action_rank_loss",
+                "classifier_vl_probe_loss", "classifier_action_probe_loss",
+            ):
+                if key in output_dict:
+                    metrics[f"train/{key}"] = float(output_dict[key])
             metrics.update(
                 {
                     "train/grad_norm_classifier": classifier_grad_norm,

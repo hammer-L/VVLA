@@ -59,7 +59,6 @@ def build_dataloader(
         )
         num_workers = int(vla_dataset_cfg.get("num_workers", 4))
         dataloader_kwargs = {
-            "batch_size": cfg.datasets.vla_data.per_device_batch_size,
             "collate_fn": collate_fn,
             "num_workers": num_workers,
             "pin_memory": bool(vla_dataset_cfg.get("pin_memory", True)),
@@ -72,10 +71,23 @@ def build_dataloader(
             dataloader_kwargs["persistent_workers"] = False if overlay_enabled else bool(vla_dataset_cfg.get("persistent_workers", True))
             dataloader_kwargs["prefetch_factor"] = int(vla_dataset_cfg.get("prefetch_factor", 2))
 
-        vla_train_dataloader = DataLoader(
-            vla_dataset,
-            **dataloader_kwargs,
-        )
+        if getattr(vla_dataset, "mode", None) == "contrastive_train":
+            from starVLA.dataloader.language_overlay import GroupedDistributedBatchSampler
+
+            dataloader_kwargs["batch_sampler"] = GroupedDistributedBatchSampler(
+                vla_dataset,
+                batch_size=int(cfg.datasets.vla_data.per_device_batch_size),
+                # Accelerate wraps whole batches across ranks after DataLoader
+                # construction. Keep the underlying sampler global here to
+                # avoid double-sharding while retaining complete triplets.
+                num_replicas=1,
+                rank=0,
+                seed=int(cfg.get("seed", 42)),
+            )
+        else:
+            dataloader_kwargs["batch_size"] = cfg.datasets.vla_data.per_device_batch_size
+
+        vla_train_dataloader = DataLoader(vla_dataset, **dataloader_kwargs)
         if not dist.is_initialized() or dist.get_rank() == 0:
             output_dir = Path(cfg.output_dir)
             vla_dataset.save_dataset_statistics(output_dir / "dataset_statistics.json")

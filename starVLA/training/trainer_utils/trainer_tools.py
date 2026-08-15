@@ -341,6 +341,18 @@ class TrainerUtils:
         if hasattr(dataloader, "sampler") and callable(getattr(dataloader.sampler, "set_epoch", None)):
             dataloader.sampler.set_epoch(epoch_counter)
 
+        # Protocol-v2 contrastive training owns grouping at the batch-sampler
+        # level. Advance it explicitly so both triplet rotation and group order
+        # change together on every reset.
+        batch_sampler = getattr(dataloader, "batch_sampler", None)
+        seen_batch_samplers = set()
+        while batch_sampler is not None and id(batch_sampler) not in seen_batch_samplers:
+            seen_batch_samplers.add(id(batch_sampler))
+            setter = getattr(batch_sampler, "set_epoch", None)
+            if callable(setter):
+                setter(epoch_counter)
+            batch_sampler = getattr(batch_sampler, "batch_sampler", None)
+
         # Dataset-level epoch state drives deterministic language-overlay
         # label/variant rotation and must advance even without a sampler.
         dataset = getattr(dataloader, "dataset", None)
