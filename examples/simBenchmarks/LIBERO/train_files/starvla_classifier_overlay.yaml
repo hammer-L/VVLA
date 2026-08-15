@@ -34,7 +34,7 @@ datasets:
     num_workers: 4
     language_overlay_meta: /root/gpufree-data/liumingyu/datasets/libero/benchmark/meta
     language_overlay_split: train
-    language_overlay_mode: balanced_train
+    language_overlay_mode: contrastive_train
 
 trainer:
   max_train_steps: 10000
