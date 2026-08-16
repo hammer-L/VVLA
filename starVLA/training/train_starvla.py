@@ -428,7 +428,8 @@ class VLATrainer(TrainerUtils):
             step_metrics["train/steps_per_second"] = 1.0 / max(t_end_model - t_start_model, 1e-12)
             self._log_metrics(step_metrics)
 
-            if self.completed_steps % self.config.trainer.save_interval == 0 and self.completed_steps > 0:
+            save_interval = getattr(self.config.trainer, "save_interval", None)
+            if save_interval and self.completed_steps % save_interval == 0 and self.completed_steps > 0:
                 self._save_checkpoint()
 
             if self.completed_steps >= self.config.trainer.max_train_steps:

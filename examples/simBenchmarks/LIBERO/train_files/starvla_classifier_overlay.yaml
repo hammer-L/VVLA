@@ -39,7 +39,9 @@ datasets:
 trainer:
   max_train_steps: 10000
   num_warmup_steps: 500
-  save_interval: 1000
+  # Disable periodic weight snapshots; validation keeps the best checkpoint and
+  # training finalization keeps the last checkpoint.
+  save_interval: null
   eval_interval: 250
   # Baseline: freeze the VLM and original action model; train only language_classifier.
   freeze_modules: "qwen_vl_interface,action_model"
