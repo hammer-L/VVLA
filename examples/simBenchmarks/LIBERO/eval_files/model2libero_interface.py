@@ -15,6 +15,7 @@ ensembling, gripper sticky logic, and chunk-cache scheduling.
 """
 
 from collections import deque
+import time
 from typing import Optional, Sequence
 
 import matplotlib.pyplot as plt
@@ -136,6 +137,7 @@ class ModelClient:
             example = {**example, "image": resized}
 
         # Refresh chunk if needed.
+        request_latency_ms = None
         if step % self.action_chunk_size == 0 or self.raw_actions is None:
             vla_input = {
                 "examples": [example],
@@ -155,7 +157,9 @@ class ModelClient:
             #   - image order : the ordering of those camera views
             #   - action normalization: unnorm_key must match the training dataset stats
             # ==============================================================================
+            request_started = time.perf_counter()
             response = self.client.predict_action(vla_input)
+            request_latency_ms = (time.perf_counter() - request_started) * 1000.0
             self._request_index += 1
             try:
                 actions_batch = response["data"]["actions"]  # (B, T, D), unnormalized server-side
@@ -176,6 +180,7 @@ class ModelClient:
         return {
             "raw_action": raw_action,
             "classifier_diagnostics": self.last_classifier_diagnostics,
+            "request_latency_ms": request_latency_ms,
         }
 
     def visualize_epoch(

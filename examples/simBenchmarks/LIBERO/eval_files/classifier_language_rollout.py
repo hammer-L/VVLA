@@ -17,6 +17,8 @@ from typing import Any, Iterable
 
 import numpy as np
 
+from starVLA.model.classifier_checkpoint import load_state_dict_file, save_classifier_checkpoint
+
 
 MODES = ("off", "rerank", "gradient", "gradient_rerank")
 POSITIVE_VARIANTS = ("canonical", "paraphrase_1", "paraphrase_2")
@@ -137,7 +139,7 @@ def new_rollout_result(
     guidance_scale: float,
     episodes: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    if phase not in {"validation", "libero_plus_language", "metadata_test"}:
+    if phase not in {"validation", "libero_original", "libero_plus_language", "metadata_test"}:
         raise ValueError(f"unknown rollout phase {phase!r}")
     if mode not in MODES:
         raise ValueError(f"unknown classifier mode {mode!r}")
@@ -310,10 +312,13 @@ def main() -> None:
     select.add_argument("results", nargs="+")
     merge = subparsers.add_parser("merge")
     merge.add_argument("results", nargs="+")
+    extract = subparsers.add_parser("extract-classifier")
+    extract.add_argument("--checkpoint", required=True, help="Legacy complete model checkpoint.")
+    extract.add_argument("--save-format", choices=("pt", "safetensors"), default="pt")
     aggregate = subparsers.add_parser("aggregate")
     aggregate.add_argument("--frozen", required=True)
     aggregate.add_argument("results", nargs=4)
-    for command in (manifest, plus, select, merge, aggregate):
+    for command in (manifest, plus, select, merge, extract, aggregate):
         command.add_argument("--output", required=True)
     args = parser.parse_args()
     if args.command == "metadata-manifest":
@@ -336,6 +341,15 @@ def main() -> None:
         output = select_validation_hyperparameters(_load_json(path) for path in args.results)
     elif args.command == "merge":
         output = merge_rollout_results(_load_json(path) for path in args.results)
+    elif args.command == "extract-classifier":
+        state = load_state_dict_file(args.checkpoint)
+        output_path = save_classifier_checkpoint(state, args.output, args.save_format)
+        compact = load_state_dict_file(output_path)
+        print(
+            f"Extracted {len(compact)} classifier tensors to {output_path} "
+            f"({output_path.stat().st_size / 1024**2:.2f} MiB)"
+        )
+        return
     else:
         output = aggregate_test_results(
             (_load_json(path) for path in args.results), _load_json(args.frozen)

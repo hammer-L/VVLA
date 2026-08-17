@@ -244,6 +244,7 @@ wandb/*
 !docs/PR_readme.md
 !docs/CONTRIBUTING.md
 !docs/classifier_guided_libero_rollout_zh.md
+!docs/qwen25_groot_libero_inference_zh.md
 !examples/simBenchmarks/LIBERO/eval_files/CLASSIFIER_LANGUAGE_EVAL.md
 !docs/faq.md
 !docs/model_zoo.md

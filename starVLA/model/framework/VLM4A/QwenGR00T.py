@@ -268,10 +268,22 @@ class Qwen_GR00T(baseframework):
             else None
         )
 
+        # A request-local generator makes rollout pairing reproducible without
+        # mutating the process-wide torch RNG.  When no seed is supplied the
+        # sampler keeps its historical behaviour.
+        generator = None
+        seed = kwargs.get("seed")
+        if seed is not None:
+            generator = torch.Generator(device=last_hidden.device)
+            generator.manual_seed(int(seed))
+
         # Step 4: Action Expert Forward
         with torch.autocast("cuda", dtype=torch.float32):
             pred_actions = self.action_model.predict_action(
-                last_hidden, state, encoder_attention_mask=backbone_attention_mask
+                last_hidden,
+                state,
+                encoder_attention_mask=backbone_attention_mask,
+                generator=generator,
             )  # (B, chunk_len, action_dim)
 
         normalized_actions = pred_actions.detach().cpu().numpy()

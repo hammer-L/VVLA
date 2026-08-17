@@ -63,8 +63,12 @@ class Args:
     job_name: str = "test"
     rollout_manifest: str = ""  # JSON produced by classifier_language_rollout.py.
     instruction_variant: str = "canonical"
-    rollout_phase: str = "libero_plus_language"
+    rollout_phase: str = "libero_original"
     result_json: str = ""
+    # The released Qwen2.5 GR00T 4-in-1 data config packs primary then wrist.
+    image_views: str = "primary,wrist"
+    # Its training config does not opt into LeRobot state packing.
+    use_state: bool = False
 
 
 def eval_libero(args: Args) -> None:
@@ -208,16 +212,33 @@ def eval_libero(args: Args) -> None:
                     "instruction": [str(task_description)],
                 }
 
-                # align key with model API --> two images provided here --> check training
+                # Keep camera count and ordering aligned with the checkpoint's training data.
+                if args.image_views == "primary":
+                    model_images = [observation["observation.primary"][0]]
+                elif args.image_views == "primary,wrist":
+                    model_images = [
+                        observation["observation.primary"][0],
+                        observation["observation.wrist_image"][0],
+                    ]
+                else:
+                    raise ValueError(
+                        "image_views must be 'primary' or 'primary,wrist', "
+                        f"got {args.image_views!r}"
+                    )
                 example_dict = {
-                    "image": [observation["observation.primary"][0], observation["observation.wrist_image"][0]],
+                    "image": model_images,
                     "lang": observation["instruction"][0],
-                    "state": observation["observation.state"],
                 }
+                if args.use_state:
+                    example_dict["state"] = observation["observation.state"]
 
                 start_time = time.time()
 
                 response = client_model.step(example=example_dict, step=step)
+                if response.get("request_latency_ms") is not None:
+                    request_diagnostics.setdefault("client_request_latency_ms", []).append(
+                        float(response["request_latency_ms"])
+                    )
                 diagnostic = response.get("classifier_diagnostics")
                 if diagnostic is not None:
                     request_diagnostics[diagnostic.get("seed", len(request_diagnostics))] = diagnostic
@@ -280,6 +301,7 @@ def eval_libero(args: Args) -> None:
             logging.info(f"# successes: {total_successes} ({total_successes / total_episodes * 100:.1f}%)")
             logging.info(f"Current total success rate: {float(total_successes) / float(total_episodes)}")
 
+            client_latencies = request_diagnostics.pop("client_request_latency_ms", [])
             diagnostics = list(request_diagnostics.values())
             selected_logits = []
             for diagnostic in diagnostics:
@@ -297,9 +319,13 @@ def eval_libero(args: Args) -> None:
                 "instruction": task_description,
                 "positive_instruction": args.instruction_variant in POSITIVE_VARIANTS,
                 "success": bool(done),
-                "latency_ms": float(np.mean([
-                    row["inference_latency_ms"] for row in diagnostics if "inference_latency_ms" in row
-                ])) if diagnostics else None,
+                "latency_ms": (
+                    float(np.mean([
+                        row["inference_latency_ms"] for row in diagnostics if "inference_latency_ms" in row
+                    ]))
+                    if diagnostics
+                    else (float(np.mean(client_latencies)) if client_latencies else None)
+                ),
                 "classifier_score": float(1.0 / (1.0 + np.exp(-np.mean(selected_logits)))) if selected_logits else None,
                 "classifier_diagnostics": diagnostics,
                 "action_trajectory": full_actions.tolist(),

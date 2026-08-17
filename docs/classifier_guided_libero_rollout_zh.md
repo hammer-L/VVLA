@@ -62,6 +62,79 @@ language_bank.jsonl
 anchors.jsonl
 ```
 
+### 2.1 只有旧版完整 classifier checkpoint 时
+
+旧训练代码生成的 `best_classifier_pytorch_model.pt` 同时包含 VLM、action
+model 和 classifier。只要该 run 使用的是当前 classifier 架构/protocol v2，
+不需要重新训练：
+
+- 旧完整 checkpoint 本身就是 `BASE_CKPT`；
+- 可以从同一个文件中一次性抽取小 `CLASSIFIER_CKPT`；
+- 服务启动时先加载完整 base，再严格加载抽取出的 classifier。
+
+例如旧权重位于：
+
+```text
+/root/gpufree-data/liumingyu/starVLA/playground/Checkpoints/s1/checkpoints/best_classifier_pytorch_model.pt
+```
+
+如果当前用户不能读取 `/root`，不要只复制 checkpoint 文件，因为 loader 还
+需要 run 目录下的 `config.yaml` 和 `dataset_statistics.json`。建议保持目录
+结构复制到当前用户可读的位置：
+
+```bash
+export OLD_RUN=/root/gpufree-data/liumingyu/starVLA/playground/Checkpoints/s1
+export LOCAL_RUN=/home/happigo/vla_ws/starVLA/playground/Checkpoints/s1_legacy
+
+mkdir -p "$LOCAL_RUN/checkpoints"
+sudo cp --reflink=auto \
+  "$OLD_RUN/checkpoints/best_classifier_pytorch_model.pt" \
+  "$LOCAL_RUN/checkpoints/"
+
+for name in config.yaml config.full.yaml dataset_statistics.json; do
+  if sudo test -f "$OLD_RUN/$name"; then
+    sudo cp "$OLD_RUN/$name" "$LOCAL_RUN/$name"
+  fi
+done
+sudo chown -R "$(id -un):$(id -gn)" "$LOCAL_RUN"
+```
+
+`--reflink=auto` 在文件系统支持时不会立即复制 9GB 数据；不支持时会退化为
+普通复制。
+
+确认配置协议：
+
+```bash
+grep -n "protocol_version\|name: QwenGR00TClassifier" \
+  "$LOCAL_RUN/config.yaml" "$LOCAL_RUN/config.full.yaml" 2>/dev/null
+```
+
+然后抽取 classifier-only 权重。该过程会把旧完整 checkpoint 加载一次到
+CPU 内存，执行时应预留约 10GB 以上可用内存：
+
+```bash
+python examples/simBenchmarks/LIBERO/eval_files/classifier_language_rollout.py \
+  extract-classifier \
+  --checkpoint "$LOCAL_RUN/checkpoints/best_classifier_pytorch_model.pt" \
+  --save-format pt \
+  --output "$LOCAL_RUN/checkpoints/best_classifier.pt"
+```
+
+成功时会输出 classifier tensor 数量和文件大小。随后设置：
+
+```bash
+export BASE_CKPT="$LOCAL_RUN/checkpoints/best_classifier_pytorch_model.pt"
+export CLASSIFIER_CKPT="$LOCAL_RUN/checkpoints/best_classifier.pt"
+```
+
+也可以临时把旧完整 checkpoint 同时传给 `BASE_CKPT` 和
+`CLASSIFIER_CKPT`；当前 loader 会自动抽取 `language_classifier.*`。但服务
+启动时需要读取完整 9GB 文件两次，因此只建议用于一次性验证。
+
+如果配置明确写的是 protocol v1，或者抽取后严格加载报告 classifier key
+缺失/尺寸不一致，就不能仅靠改名兼容，需要针对旧 classifier 架构写转换或
+重新训练。不要把 protocol v1 配置直接伪装成 v2。
+
 检查 metadata 协议和 split 完整性：
 
 ```bash
@@ -249,7 +322,7 @@ python -m json.tool "$RESULT_ROOT/smoke_off.json" | head -80
 - `mode` 为 `off`；
 - `episodes` 非空；
 - 每个 episode 包含 `success`、`latency_ms`、`classifier_diagnostics`；
-- state 维度为 7，服务端没有 shape error；
+- 如果 base VLA 训练时使用 state，则传入的 state 维度为 7 且服务端没有 shape error；
 - action 反归一化 key 与 LIBERO 训练数据一致。
 
 smoke test 成功后停止终端 A 的服务。
@@ -477,8 +550,10 @@ metadata 的 task 编号与 LIBERO benchmark task ID 不一致。通过
 
 ### state shape 错误
 
-QwenGR00TClassifier 的 LIBERO 配置要求 state 为 `[1, 7]`：末端位置 3 维、
-axis-angle 3 维、单个 gripper 状态 1 维。当前 evaluator 已按此格式发送。
+如果 base VLA 训练时使用 state，QwenGR00TClassifier 的 LIBERO 配置要求
+state 为 `[1, 7]`：末端位置 3 维、axis-angle 3 维、单个 gripper 状态 1
+维；运行 evaluator 时启用 `--args.use-state`。官方 Qwen2.5 GR00T 4-in-1
+配置只声明了 `obs: [image_0]`，应保持默认，不传 state。
 
 ### CUDA OOM
 
