@@ -22,12 +22,20 @@ def main(args) -> None:
     if config_overrides:
         override_keys = [item.split("=", 1)[0] for item in config_overrides]
         logging.info("Applying config override keys: %s", override_keys)
-    wrapper = PolicyServerWrapper(
+    wrapper_kwargs = dict(
         ckpt_path=args.ckpt_path,
         device="cuda",
         use_bf16=args.use_bf16,
         config_overrides=config_overrides,
     )
+    arg_values = vars(args)
+    for name in (
+        "base_ckpt_path", "classifier_ckpt_path", "classifier_mode",
+        "num_candidates", "guidance_scale",
+    ):
+        if name in arg_values:
+            wrapper_kwargs[name] = arg_values[name]
+    wrapper = PolicyServerWrapper(**wrapper_kwargs)
 
     hostname = socket.gethostname()
     local_ip = socket.gethostbyname(hostname)
@@ -52,7 +60,7 @@ def main(args) -> None:
         "[TRAIN/TEST CONSISTENCY CHECK] serving ckpt=%s — verify eval observations "
         "(state / image size / image count / image order / action normalization) match "
         "the training config. metadata=%s",
-        args.ckpt_path,
+        getattr(args, "base_ckpt_path", None) or args.ckpt_path,
         wrapper.metadata,
     )
 
@@ -70,7 +78,16 @@ def main(args) -> None:
 
 def build_argparser():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--ckpt_path", type=str, default="Qwen/Qwen2.5-VL-3B-Instruct")
+    parser.add_argument("--ckpt_path", type=str, default=None, help="Legacy alias for --base_ckpt_path")
+    parser.add_argument("--base_ckpt_path", type=str, default=None, help="Complete base VLA checkpoint")
+    parser.add_argument("--classifier_ckpt_path", type=str, default=None, help="Classifier-only checkpoint")
+    parser.add_argument(
+        "--classifier_mode",
+        choices=("off", "rerank", "gradient", "gradient_rerank"),
+        default="off",
+    )
+    parser.add_argument("--num_candidates", type=int, default=1)
+    parser.add_argument("--guidance_scale", type=float, default=0.0)
     parser.add_argument("--port", type=int, default=10093)
     parser.add_argument("--use_bf16", action="store_true")
     parser.add_argument("--idle_timeout", type=int, default=1800, help="Idle timeout in seconds, -1 means never close")

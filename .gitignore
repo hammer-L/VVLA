@@ -243,6 +243,8 @@ wandb/*
 !docs/branching_strategy.md
 !docs/PR_readme.md
 !docs/CONTRIBUTING.md
+!docs/classifier_guided_libero_rollout_zh.md
+!examples/simBenchmarks/LIBERO/eval_files/CLASSIFIER_LANGUAGE_EVAL.md
 !docs/faq.md
 !docs/model_zoo.md
 !docs/starVLA_guideline.md

@@ -5,6 +5,7 @@
 
 
 from dataclasses import dataclass, field
+from typing import Callable
 
 import torch
 import torch.nn.functional as F
@@ -362,26 +363,49 @@ class FlowmatchingActionHead(nn.Module):
         loss = ((pred_actions - velocity) ** 2).mean()
         return loss
 
-    @torch.no_grad()
     def predict_action(
         self,
         vl_embs: torch.Tensor,
         state: torch.Tensor = None,
         encoder_attention_mask=None,
-    ) -> torch.Tensor:
+        *,
+        guidance_callback: Callable[[torch.Tensor], torch.Tensor] | None = None,
+        guidance_scale: float = 0.0,
+        generator: torch.Generator | None = None,
+        initial_actions: torch.Tensor | None = None,
+        action_bounds: tuple[torch.Tensor, torch.Tensor] | None = None,
+        return_diagnostics: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, dict]:
+        """Sample an action chunk, optionally applying classifier guidance.
+
+        ``guidance_callback`` must return one scalar logit per batch item.  Its
+        gradient is taken only with respect to the current normalized actions;
+        model and classifier parameter ``.grad`` buffers are never populated.
+        """
         # Set initial actions as the sampled noise.
         batch_size = vl_embs.shape[0]
         device = vl_embs.device
-        actions = torch.randn(
-            size=(batch_size, self.action_horizon, self.action_dim),
-            dtype=vl_embs.dtype,
-            device=device,
-        )
+        if initial_actions is None:
+            actions = torch.randn(
+                size=(batch_size, self.action_horizon, self.action_dim),
+                dtype=vl_embs.dtype,
+                device=device,
+                generator=generator,
+            )
+        else:
+            expected_shape = (batch_size, self.action_horizon, self.action_dim)
+            if tuple(initial_actions.shape) != expected_shape:
+                raise ValueError(f"initial_actions must have shape {expected_shape}, got {tuple(initial_actions.shape)}")
+            actions = initial_actions.to(device=device, dtype=vl_embs.dtype).clone()
 
         num_steps = self.num_inference_timesteps
         dt = 1.0 / num_steps
 
-        state_features = self.state_encoder(state) if state is not None else None
+        with torch.no_grad():
+            state_features = self.state_encoder(state) if state is not None else None
+
+        guidance_before: list[list[float]] = []
+        guidance_after: list[list[float]] = []
 
         # Run denoising steps.
         for t in range(num_steps):
@@ -390,34 +414,58 @@ class FlowmatchingActionHead(nn.Module):
 
             # Embed noised action trajectory.
             timesteps_tensor = torch.full(size=(batch_size,), fill_value=t_discretized, device=device)
-            action_features = self.action_encoder(actions, timesteps_tensor)
-            # Maybe add position embedding.
-            if self.config.add_pos_embed:
-                pos_ids = torch.arange(action_features.shape[1], dtype=torch.long, device=device)
-                pos_embs = self.position_embedding(pos_ids).unsqueeze(0)
-                action_features = action_features + pos_embs
+            with torch.no_grad():
+                action_features = self.action_encoder(actions, timesteps_tensor)
+                # Maybe add position embedding.
+                if self.config.add_pos_embed:
+                    pos_ids = torch.arange(action_features.shape[1], dtype=torch.long, device=device)
+                    pos_embs = self.position_embedding(pos_ids).unsqueeze(0)
+                    action_features = action_features + pos_embs
 
-            # Join vision, language, state and action embedding along sequence dimension.
-            future_tokens = self.future_tokens.weight.unsqueeze(0).expand(vl_embs.shape[0], -1, -1)
-            sa_embs = (
-                torch.cat((state_features, future_tokens, action_features), dim=1)
-                if state_features is not None
-                else torch.cat((future_tokens, action_features), dim=1)
-            )
+                # Join vision, language, state and action embedding along sequence dimension.
+                future_tokens = self.future_tokens.weight.unsqueeze(0).expand(vl_embs.shape[0], -1, -1)
+                sa_embs = (
+                    torch.cat((state_features, future_tokens, action_features), dim=1)
+                    if state_features is not None
+                    else torch.cat((future_tokens, action_features), dim=1)
+                )
 
-            # Run model forward.
-            model_output = self.model(
-                hidden_states=sa_embs,
-                encoder_hidden_states=vl_embs,
-                encoder_attention_mask=encoder_attention_mask,
-                timestep=timesteps_tensor,
-            )
-            pred = self.action_decoder(model_output)
+                model_output = self.model(
+                    hidden_states=sa_embs,
+                    encoder_hidden_states=vl_embs,
+                    encoder_attention_mask=encoder_attention_mask,
+                    timestep=timesteps_tensor,
+                )
+                pred = self.action_decoder(model_output)
+                pred_velocity = pred[:, -self.action_horizon :]
+                actions = actions + dt * pred_velocity
 
-            pred_velocity = pred[:, -self.action_horizon :]
+            if guidance_callback is not None and guidance_scale != 0.0:
+                with torch.enable_grad():
+                    guided_actions = actions.detach().requires_grad_(True)
+                    logits_before = guidance_callback(guided_actions)
+                    if tuple(logits_before.shape) != (batch_size,):
+                        raise ValueError(
+                            "guidance_callback must return shape "
+                            f"({batch_size},), got {tuple(logits_before.shape)}"
+                        )
+                    action_gradient = torch.autograd.grad(logits_before.sum(), guided_actions)[0]
+                    gradient_rms = action_gradient.float().square().mean(dim=(1, 2), keepdim=True).sqrt()
+                    normalized_gradient = action_gradient / gradient_rms.to(action_gradient.dtype).clamp_min(1e-8)
+                    guided_actions = guided_actions + dt * float(guidance_scale) * normalized_gradient
+                    if action_bounds is not None:
+                        lower, upper = action_bounds
+                        guided_actions = torch.maximum(guided_actions, lower).minimum(upper)
+                    logits_after = guidance_callback(guided_actions)
+                guidance_before.append(logits_before.detach().float().cpu().tolist())
+                guidance_after.append(logits_after.detach().float().cpu().tolist())
+                actions = guided_actions.detach()
 
-            # Update actions using euler integration.
-            actions = actions + dt * pred_velocity
+        if return_diagnostics:
+            return actions, {
+                "guidance_logits_before_steps": guidance_before,
+                "guidance_logits_after_steps": guidance_after,
+            }
         return actions
 
     @property

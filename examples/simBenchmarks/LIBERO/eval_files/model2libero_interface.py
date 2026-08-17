@@ -39,6 +39,7 @@ class ModelClient:
         host: str = "0.0.0.0",
         port: int = 10095,
         image_size: Sequence[int] = (224, 224),
+        seed: int = 42,
     ) -> None:
         # Connect & receive handshake metadata (action_chunk_size, etc.)
         self.client = WebsocketClientPolicy(host, port)
@@ -81,12 +82,16 @@ class ModelClient:
 
         # Cached unnormalized chunk; refreshed every `action_chunk_size` steps.
         self.raw_actions: Optional[np.ndarray] = None
+        self.seed = int(seed)
+        self._rollout_seed = int(seed)
+        self._request_index = 0
+        self.last_classifier_diagnostics: Optional[dict] = None
 
     def _add_image_to_history(self, image: np.ndarray) -> None:
         self.image_history.append(image)
         self.num_image_history = min(self.num_image_history + 1, self.horizon)
 
-    def reset(self, task_description: str) -> None:
+    def reset(self, task_description: str, request_seed: Optional[int] = None) -> None:
         self.task_description = task_description
         self.image_history.clear()
         if self.action_ensemble:
@@ -97,6 +102,9 @@ class ModelClient:
         self.sticky_gripper_action = 0.0
         self.previous_gripper_action = None
         self.raw_actions = None
+        self._rollout_seed = self.seed if request_seed is None else int(request_seed)
+        self._request_index = 0
+        self.last_classifier_diagnostics = None
 
     def step(self, example: dict, step: int = 0, **kwargs) -> dict:
         """One env step.
@@ -135,6 +143,7 @@ class ModelClient:
                 "do_sample": False,
                 "use_ddim": self.use_ddim,
                 "num_ddim_steps": self.num_ddim_steps,
+                "seed": self._rollout_seed + self._request_index,
             }
             # === TRAIN/TEST CONSISTENCY: keep the observation below aligned with training ===
             # Embodied policies degrade SILENTLY (no error) when the eval-time observation
@@ -147,6 +156,7 @@ class ModelClient:
             #   - action normalization: unnorm_key must match the training dataset stats
             # ==============================================================================
             response = self.client.predict_action(vla_input)
+            self._request_index += 1
             try:
                 actions_batch = response["data"]["actions"]  # (B, T, D), unnormalized server-side
             except KeyError:
@@ -155,6 +165,7 @@ class ModelClient:
                     f"full response={response}"
                 )
             self.raw_actions = np.asarray(actions_batch)[0]  # (T, D)
+            self.last_classifier_diagnostics = response.get("data", {}).get("classifier_diagnostics")
 
         raw_actions = self.raw_actions[step % self.action_chunk_size][None]
         raw_action = {
@@ -162,7 +173,10 @@ class ModelClient:
             "rotation_delta": np.array(raw_actions[0, 3:6]),
             "open_gripper": np.array(raw_actions[0, 6:7]),  # 1 = open; 0 = close
         }
-        return {"raw_action": raw_action}
+        return {
+            "raw_action": raw_action,
+            "classifier_diagnostics": self.last_classifier_diagnostics,
+        }
 
     def visualize_epoch(
         self, predicted_raw_actions: Sequence[np.ndarray], images: Sequence[np.ndarray], save_path: str

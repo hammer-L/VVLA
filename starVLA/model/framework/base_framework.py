@@ -256,6 +256,7 @@ class baseframework(PreTrainedModel):
         cls,
         pretrained_checkpoint: str,
         config_overrides: Sequence[str] | None = None,
+        allowed_missing_prefixes: Sequence[str] | None = None,
         **kwargs,
     ) -> None:
         """
@@ -303,7 +304,19 @@ class baseframework(PreTrainedModel):
         model_keys = set(FrameworkModel.state_dict().keys())
         checkpoint_keys = set(model_state_dict.keys())
         try:
-            FrameworkModel.load_state_dict(model_state_dict, strict=True)
+            if allowed_missing_prefixes:
+                incompatible = FrameworkModel.load_state_dict(model_state_dict, strict=False)
+                invalid_missing = [
+                    key for key in incompatible.missing_keys
+                    if not any(key.startswith(prefix) for prefix in allowed_missing_prefixes)
+                ]
+                if invalid_missing or incompatible.unexpected_keys:
+                    raise RuntimeError(
+                        "Checkpoint mismatch outside allowed missing modules: "
+                        f"missing={invalid_missing}, unexpected={incompatible.unexpected_keys}"
+                    )
+            else:
+                FrameworkModel.load_state_dict(model_state_dict, strict=True)
         except RuntimeError as e:
             # must keep all keys matched
             common_keys = model_keys.intersection(checkpoint_keys)

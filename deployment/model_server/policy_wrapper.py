@@ -29,6 +29,7 @@ import torch
 
 from starVLA.model.framework.base_framework import baseframework, merge_config_overrides
 from starVLA.model.framework.share_tools import read_mode_config
+from starVLA.model.classifier_checkpoint import load_classifier_checkpoint
 
 from deployment.model_server.policy_norm_processor import PolicyNormProcessor
 
@@ -55,16 +56,52 @@ class PolicyServerWrapper:
 
     def __init__(
         self,
-        ckpt_path: str,
+        ckpt_path: Optional[str] = None,
         device: str = "cuda",
         use_bf16: bool = False,
         unnorm_key: Optional[str] = None,
         config_overrides: Sequence[str] | None = None,
+        base_ckpt_path: Optional[str] = None,
+        classifier_ckpt_path: Optional[str] = None,
+        classifier_mode: str = "off",
+        num_candidates: int = 1,
+        guidance_scale: float = 0.0,
     ) -> None:
-        self._ckpt_path = str(ckpt_path)
+        valid_modes = {"off", "rerank", "gradient", "gradient_rerank"}
+        if classifier_mode not in valid_modes:
+            raise ValueError(f"classifier_mode must be one of {sorted(valid_modes)}")
+        if classifier_mode != "off" and (not base_ckpt_path or not classifier_ckpt_path):
+            raise ValueError(
+                "Classifier-assisted modes require both base_ckpt_path and classifier_ckpt_path"
+            )
+        if base_ckpt_path and ckpt_path and str(base_ckpt_path) != str(ckpt_path):
+            raise ValueError("ckpt_path and base_ckpt_path refer to different base checkpoints")
+        resolved_base = base_ckpt_path or ckpt_path
+        if not resolved_base:
+            raise ValueError("One of ckpt_path or base_ckpt_path is required")
+        self._ckpt_path = str(resolved_base)
+        self._classifier_ckpt_path = str(classifier_ckpt_path) if classifier_ckpt_path else None
+        self._classifier_mode = classifier_mode
+        self._num_candidates = int(num_candidates)
+        self._guidance_scale = float(guidance_scale)
 
         logging.info("PolicyServerWrapper: loading framework from %s", self._ckpt_path)
-        framework = baseframework.from_pretrained(self._ckpt_path, config_overrides=config_overrides)
+        resolved_overrides = list(config_overrides or [])
+        if classifier_ckpt_path:
+            resolved_overrides = [
+                item for item in resolved_overrides if not item.startswith("framework.name=")
+            ]
+            resolved_overrides.append("framework.name=QwenGR00TClassifier")
+        framework = baseframework.from_pretrained(
+            self._ckpt_path,
+            config_overrides=resolved_overrides if classifier_ckpt_path else config_overrides,
+            **({"allowed_missing_prefixes": ("language_classifier.",)} if classifier_ckpt_path else {}),
+        )
+        if classifier_ckpt_path:
+            classifier = getattr(framework, "language_classifier", None)
+            if classifier is None:
+                raise TypeError("Resolved framework does not expose language_classifier")
+            load_classifier_checkpoint(classifier, classifier_ckpt_path)
         if use_bf16:
             framework = framework.to(torch.bfloat16)
         framework = framework.to(device).eval()
@@ -141,6 +178,11 @@ class PolicyServerWrapper:
         base = {
             "env": "starvla_policy_server",
             "ckpt_path": self._ckpt_path,
+            "base_ckpt_path": self._ckpt_path,
+            "classifier_ckpt_path": self._classifier_ckpt_path,
+            "classifier_mode": self._classifier_mode,
+            "num_candidates": self._num_candidates,
+            "guidance_scale": self._guidance_scale,
             "action_chunk_size": self._action_chunk_size,
             "available_unnorm_keys": self._available_unnorm_keys,
             "default_unnorm_key": self._default_unnorm_key,
@@ -187,6 +229,10 @@ class PolicyServerWrapper:
                 )
         proc = self._get_processor(effective_key)
 
+        if self._classifier_ckpt_path is not None or self._classifier_mode != "off":
+            kwargs.setdefault("classifier_mode", self._classifier_mode)
+            kwargs.setdefault("num_candidates", self._num_candidates)
+            kwargs.setdefault("guidance_scale", self._guidance_scale)
         out = self._framework.predict_action(examples=examples, **kwargs)
         normalized = np.asarray(out["normalized_actions"])  # (B, T, D)
 
@@ -194,4 +240,6 @@ class PolicyServerWrapper:
             [proc.unapply_actions(normalized[b]) for b in range(normalized.shape[0])],
             axis=0,
         )
-        return {"actions": unnorm}
+        response = {"actions": unnorm}
+        response.update({key: value for key, value in out.items() if key != "normalized_actions"})
+        return response

@@ -527,10 +527,14 @@ class TrainerUtils:
             self.accelerator.print(f"No checkpoint directory found at {checkpoint_dir}")
             return None, 0
 
-        # Find all checkpoints matching the naming convention, supports .pt and .safetensors
+        # Classifier-only snapshots use ``steps_N_classifier.*``.  Keep the
+        # legacy full-model names so non-classifier runs and old resumes work.
+        checkpoint_pattern = re.compile(
+            r"steps_(\d+)_(?:classifier\.(?:pt|safetensors)|pytorch_model\.pt|model\.safetensors)$"
+        )
         checkpoints = [
             f for f in os.listdir(checkpoint_dir) 
-            if re.match(r"steps_(\d+)_(?:pytorch_model\.pt|model\.safetensors)$", f)
+            if checkpoint_pattern.match(f)
             and os.path.isfile(os.path.join(checkpoint_dir, f))  # ensure it is a file
         ]
 
@@ -541,7 +545,7 @@ class TrainerUtils:
         # Extract step numbers and sort
         try:
             checkpoints_with_steps = [
-                (ckpt, int(re.search(r"steps_(\d+)_(?:pytorch_model\.pt|model\.safetensors)$", ckpt).group(1)))
+                (ckpt, int(checkpoint_pattern.match(ckpt).group(1)))
                 for ckpt in checkpoints
             ]
         except AttributeError as e:

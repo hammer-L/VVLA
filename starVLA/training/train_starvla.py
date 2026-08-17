@@ -45,6 +45,12 @@ from transformers import AutoProcessor, get_scheduler
 from starVLA.dataloader import build_dataloader
 from starVLA.model.framework.base_framework import build_framework
 from starVLA.model.framework.share_tools import apply_config_compat
+from starVLA.model.classifier_checkpoint import (
+    classifier_checkpoint_path,
+    load_classifier_checkpoint,
+    load_state_dict_file,
+    save_classifier_checkpoint,
+)
 from starVLA.training.classifier_metrics import (
     binary_classifier_metrics,
     classifier_record_report,
@@ -278,6 +284,46 @@ class VLATrainer(TrainerUtils):
         is_resume = getattr(self.config.trainer, "is_resume", False)
         self.resume_from_checkpoint = pretrained_checkpoint
 
+        if hasattr(self.model, "language_classifier"):
+            # Classifier training always starts from an explicit, fully trained
+            # VLA.  The legacy field remains a compatibility fallback only.
+            base_checkpoint = getattr(self.config.trainer, "base_vla_checkpoint", None) or pretrained_checkpoint
+            if not base_checkpoint:
+                raise ValueError(
+                    "QwenGR00TClassifier training requires trainer.base_vla_checkpoint "
+                    "(legacy trainer.pretrained_checkpoint is accepted as a fallback)"
+                )
+            base_state = load_state_dict_file(base_checkpoint)
+            incompatible = self.model.load_state_dict(base_state, strict=False)
+            invalid_missing = [
+                key for key in incompatible.missing_keys if not key.startswith("language_classifier.")
+            ]
+            if invalid_missing or incompatible.unexpected_keys:
+                raise RuntimeError(
+                    "Base VLA checkpoint is incompatible with the classifier model: "
+                    f"missing={invalid_missing[:8]}, unexpected={incompatible.unexpected_keys[:8]}"
+                )
+            logger.info(f"Loaded base VLA checkpoint: {base_checkpoint}")
+            self.resume_from_checkpoint = str(base_checkpoint)
+
+            if is_resume:
+                resume_checkpoint, self.completed_steps = self._get_latest_checkpoint(self.checkpoint_dir)
+                if resume_checkpoint:
+                    load_classifier_checkpoint(self.model.language_classifier, resume_checkpoint)
+                    self.resume_from_checkpoint = resume_checkpoint
+                    logger.info(
+                        f"Resumed classifier from checkpoint: {resume_checkpoint}, steps: {self.completed_steps}"
+                    )
+                    return
+                logger.warning(f"No classifier checkpoint found in {self.checkpoint_dir}; starting at step 0")
+
+            warm_start = getattr(self.config.trainer, "pretrained_classifier_checkpoint", None)
+            if warm_start:
+                load_classifier_checkpoint(self.model.language_classifier, warm_start)
+                logger.info(f"Warm-started language classifier from: {warm_start}")
+            self.completed_steps = 0
+            return
+
         if is_resume:
             resume_from_checkpoint, self.completed_steps = self._get_latest_checkpoint(self.checkpoint_dir)
             if resume_from_checkpoint:
@@ -318,6 +364,27 @@ class VLATrainer(TrainerUtils):
 
     def _save_checkpoint(self):
         """Save current training state."""
+        unwrapped = self.accelerator.unwrap_model(self.model)
+        if hasattr(unwrapped, "language_classifier"):
+            # ZeRO consolidation is collective; all ranks must enter this call.
+            state_dict = self.accelerator.get_state_dict(self.model)
+            if self.accelerator.is_main_process:
+                save_format = getattr(self.config.trainer, "save_format", "pt")
+                checkpoint = classifier_checkpoint_path(
+                    self.checkpoint_dir, f"steps_{self.completed_steps}_classifier", save_format
+                )
+                save_classifier_checkpoint(state_dict, checkpoint, save_format)
+                summary_data = {"steps": self.completed_steps, "classifier_checkpoint": str(checkpoint)}
+                with open(os.path.join(self.config.output_dir, "summary.jsonl"), "a") as handle:
+                    handle.write(json.dumps(summary_data) + "\n")
+                self.accelerator.print(f"✅ Classifier checkpoint saved at {checkpoint}")
+                if isinstance(self.config, AccessTrackedConfig):
+                    self.config.save_accessed_config(
+                        Path(self.config.output_dir) / "config.yaml", use_original_values=False
+                    )
+            self.accelerator.wait_for_everyone()
+            return
+
         if self.accelerator.is_main_process:
             save_format = getattr(self.config.trainer, "save_format", "pt")
             checkpoint_path = os.path.join(self.checkpoint_dir, f"steps_{self.completed_steps}")
@@ -446,7 +513,7 @@ class VLATrainer(TrainerUtils):
         self._finalize_training()
 
     def _evaluate_selected_classifier_test(self) -> None:
-        """Load the selected validation checkpoint and evaluate test exactly once."""
+        """Run the held-out classifier diagnostic with the validation selection."""
         self.accelerator.wait_for_everyone()
         selection_path = Path(self.checkpoint_dir) / "best_classifier.json"
         if not selection_path.exists():
@@ -455,13 +522,14 @@ class VLATrainer(TrainerUtils):
         if selection.get("protocol_version") != "2.0.0":
             raise RuntimeError("refusing protocol-v1 classifier checkpoint; retrain with v2 metadata")
         checkpoint = selection["checkpoint"]
-        state_dict = torch.load(checkpoint, map_location="cpu", weights_only=True)
-        self.accelerator.unwrap_model(self.model).load_state_dict(state_dict)
+        load_classifier_checkpoint(
+            self.accelerator.unwrap_model(self.model).language_classifier, checkpoint
+        )
         self.best_classifier_checkpoint = checkpoint
         self.classifier_threshold = float(selection["threshold"])
         self._evaluate_classifier_loader(
             self.vla_test_dataloader,
-            prefix="test",
+            prefix="diagnostic",
             threshold=self.classifier_threshold,
             select_checkpoint=False,
         )
@@ -536,7 +604,12 @@ class VLATrainer(TrainerUtils):
         records = gather_classifier_records(local_records)
         result = dict(step_metrics or {})
         report = None
-        report_path = Path(self.config.output_dir) / f"{prefix}_classifier_report_step_{self.completed_steps}.json"
+        report_name = (
+            f"classifier_diagnostic_report_step_{self.completed_steps}.json"
+            if prefix == "diagnostic"
+            else f"{prefix}_classifier_report_step_{self.completed_steps}.json"
+        )
+        report_path = Path(self.config.output_dir) / report_name
         should_save_best = False
         if self.accelerator.is_main_process:
             bootstrap_samples = int(model.config.framework.classifier.get("bootstrap_samples", 10_000))
@@ -606,8 +679,9 @@ class VLATrainer(TrainerUtils):
 
     def _save_best_classifier(self, report: dict, report_path: Path, state_dict: dict) -> None:
         score = self._classifier_checkpoint_score(report)
-        checkpoint = Path(self.checkpoint_dir) / "best_classifier_pytorch_model.pt"
-        torch.save(state_dict, checkpoint)
+        save_format = getattr(self.config.trainer, "save_format", "pt")
+        checkpoint = classifier_checkpoint_path(self.checkpoint_dir, "best_classifier", save_format)
+        save_classifier_checkpoint(state_dict, checkpoint, save_format)
         selection = {
             "protocol_version": "2.0.0",
             "step": self.completed_steps,
@@ -727,6 +801,23 @@ class VLATrainer(TrainerUtils):
 
     def _finalize_training(self):
         """Training end processing."""
+        unwrapped = self.accelerator.unwrap_model(self.model)
+        if hasattr(unwrapped, "language_classifier"):
+            state_dict = self.accelerator.get_state_dict(self.model)
+            if self.accelerator.is_main_process:
+                save_format = getattr(self.config.trainer, "save_format", "pt")
+                final_dir = Path(self.config.output_dir) / "final_model"
+                checkpoint = classifier_checkpoint_path(final_dir, "classifier", save_format)
+                save_classifier_checkpoint(state_dict, checkpoint, save_format)
+                logger.info(f"Training complete. Final classifier saved at {checkpoint}")
+            if self.accelerator.is_main_process and getattr(self, "_wandb_enabled", False):
+                try:
+                    wandb.finish()
+                except Exception:
+                    pass
+            self.accelerator.wait_for_everyone()
+            return
+
         if self.accelerator.is_main_process:
             save_format = getattr(self.config.trainer, "save_format", "pt")
             final_checkpoint = os.path.join(self.config.output_dir, "final_model")
