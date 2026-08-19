@@ -18,6 +18,7 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 from examples.simBenchmarks.LIBERO.eval_files.model2libero_interface import ModelClient
 from examples.simBenchmarks.LIBERO.eval_files.classifier_language_rollout import (
     POSITIVE_VARIANTS,
+    assert_manifest_task_alignment,
     new_rollout_result,
 )
 
@@ -46,6 +47,8 @@ class Args:
     num_steps_wait: int = 10  # Number of steps to wait for objects to stabilize i n sim
     num_trials_per_task: int = 50  # Number of rollouts per task
     max_tasks: int = -1  # If > 0, limit the number of tasks evaluated (smoke / quick check). -1 = run all.
+    max_episodes_per_task: int = -1  # If > 0, cap episodes for each task (use 1 for smoke tests).
+    task_ids: str = ""  # Optional comma-separated simulator task IDs, e.g. "0,8".
 
     #################################################################################################################
     # Utils
@@ -70,6 +73,7 @@ class Args:
     image_views: str = "primary,wrist"
     # Its training config does not opt into LeRobot state packing.
     use_state: bool = False
+    validate_manifest_tasks: bool = True
 
 
 def eval_libero(args: Args) -> None:
@@ -109,8 +113,10 @@ def eval_libero(args: Args) -> None:
     )
 
     manifest_entries = []
+    manifest_all_entries = []
     if args.rollout_manifest:
         manifest = json.loads(pathlib.Path(args.rollout_manifest).read_text(encoding="utf-8"))
+        manifest_all_entries = manifest["entries"]
         manifest_entries = [
             row for row in manifest["entries"]
             if row["suite"] == args.task_suite_name and row["variant_id"] == args.instruction_variant
@@ -126,6 +132,22 @@ def eval_libero(args: Args) -> None:
     else:
         eval_task_ids = list(range(num_tasks_in_suite))
         manifest_by_task = {}
+
+    if args.task_ids:
+        try:
+            requested_task_ids = [
+                int(item) for item in args.task_ids.split(",") if item.strip()
+            ]
+        except ValueError as exc:
+            raise ValueError(f"task_ids must be comma-separated integers: {exc}") from exc
+        if not requested_task_ids:
+            raise ValueError("task_ids must contain at least one integer")
+        missing_task_ids = sorted(set(requested_task_ids) - set(eval_task_ids))
+        if missing_task_ids:
+            raise ValueError(
+                f"requested task_ids are absent from this evaluation selection: {missing_task_ids}"
+            )
+        eval_task_ids = list(dict.fromkeys(requested_task_ids))
 
     # Optional smoke-test cap (still useful for quick verification with -1 = full run).
     if args.max_tasks > 0:
@@ -146,6 +168,13 @@ def eval_libero(args: Args) -> None:
         # Initialize LIBERO environment and task description
         env, canonical_task_description = _get_libero_env(task, LIBERO_ENV_RESOLUTION, args.seed)
         task_manifest_rows = manifest_by_task.get(task_id, [])
+        if task_manifest_rows and args.validate_manifest_tasks:
+            assert_manifest_task_alignment(
+                manifest_all_entries,
+                args.task_suite_name,
+                task_id,
+                canonical_task_description,
+            )
         task_description = (
             task_manifest_rows[0]["instruction"] if task_manifest_rows else canonical_task_description
         )
@@ -157,6 +186,8 @@ def eval_libero(args: Args) -> None:
             if task_manifest_rows
             else list(range(args.num_trials_per_task))
         )
+        if args.max_episodes_per_task > 0:
+            episode_indices = episode_indices[: args.max_episodes_per_task]
         for episode_idx in tqdm.tqdm(episode_indices):
             logging.info(f"\nTask: {task_description}")
 

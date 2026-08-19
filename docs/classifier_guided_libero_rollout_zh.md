@@ -193,15 +193,12 @@ libero_90
 `task_index` 与 LIBERO task ID 一致，可以跳过映射文件。
 
 如果数据集名称类似
-`libero_goal_no_noops_1.0.0_lerobot`，创建 `$RESULT_ROOT/suite_map.json`：
+`libero_goal_no_noops_1.0.0_lerobot`，suite 名和 task ID 都需要映射。复制仓库提供的
+IPEC LeRobot 完整映射：
 
-```json
-{
-  "libero_spatial_no_noops_1.0.0_lerobot": {"suite": "libero_spatial"},
-  "libero_object_no_noops_1.0.0_lerobot": {"suite": "libero_object"},
-  "libero_goal_no_noops_1.0.0_lerobot": {"suite": "libero_goal"},
-  "libero_10_no_noops_1.0.0_lerobot": {"suite": "libero_10"}
-}
+```bash
+cp examples/simBenchmarks/LIBERO/eval_files/ipec_lerobot_suite_map.json \
+  "$RESULT_ROOT/suite_map.json"
 ```
 
 如果 task ID 也不同，可以显式映射：

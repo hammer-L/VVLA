@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 from pathlib import Path
 from statistics import mean
 from typing import Any, Iterable
@@ -34,6 +35,97 @@ SEARCH_SPACE = {
     "gradient": tuple((1, scale) for scale in (0.03, 0.1, 0.3)),
     "gradient_rerank": tuple((k, scale) for k in (2, 4, 8) for scale in (0.03, 0.1, 0.3)),
 }
+
+
+def normalize_instruction(text: str) -> str:
+    """Normalize task text for exact canonical-task alignment checks."""
+    return " ".join(re.findall(r"[a-z0-9]+", str(text).casefold()))
+
+
+def assert_manifest_task_alignment(
+    entries: Iterable[dict[str, Any]],
+    suite: str,
+    task_index: int,
+    environment_instruction: str,
+) -> str:
+    """Reject a manifest task ID that points at a different simulator goal."""
+    task_rows = [
+        row for row in entries
+        if row.get("suite") == suite and int(row.get("task_index", -1)) == int(task_index)
+    ]
+    canonical_instructions = {
+        str(row["canonical_instruction"])
+        for row in task_rows
+        if row.get("canonical_instruction")
+    }
+    canonical_instructions.update(
+        str(row["instruction"])
+        for row in task_rows
+        if row.get("variant_id") == "canonical" and row.get("instruction")
+    )
+    normalized = {normalize_instruction(text): text for text in canonical_instructions}
+    if not normalized:
+        raise ValueError(
+            f"manifest has no canonical instruction for {suite} task {task_index}; "
+            "regenerate it with metadata-manifest"
+        )
+    if len(normalized) != 1:
+        raise ValueError(
+            f"manifest maps multiple canonical instructions to {suite} task {task_index}: "
+            f"{sorted(canonical_instructions)}"
+        )
+    expected_normalized, expected = next(iter(normalized.items()))
+    if expected_normalized != normalize_instruction(environment_instruction):
+        raise ValueError(
+            "rollout manifest task mismatch: "
+            f"{suite} task {task_index} is {environment_instruction!r} in LIBERO, "
+            f"but the manifest maps it to {expected!r}. Fix suite_map.json task_index_map "
+            "and regenerate/remap the manifest before running rollouts."
+        )
+    return expected
+
+
+def _mapped_suite_and_task(
+    source_suite: str,
+    source_task_index: int,
+    suite_map: dict[str, Any] | None,
+) -> tuple[str, int]:
+    mapping = (suite_map or {}).get(source_suite, {})
+    if isinstance(mapping, str):
+        mapping = {"suite": mapping}
+    if not isinstance(mapping, dict):
+        raise ValueError(f"suite map entry for {source_suite!r} must be a string or object")
+    rollout_suite = str(mapping.get("suite", source_suite))
+    task_map = mapping.get("task_index_map")
+    if task_map is None:
+        return rollout_suite, int(source_task_index)
+    if not isinstance(task_map, dict):
+        raise ValueError(f"task_index_map for {source_suite!r} must be an object")
+    mapped = task_map.get(str(source_task_index), task_map.get(source_task_index))
+    if mapped is None:
+        raise ValueError(
+            f"task_index_map for {source_suite!r} lacks source task {source_task_index}"
+        )
+    return rollout_suite, int(mapped)
+
+
+def remap_metadata_manifest(
+    manifest: dict[str, Any], suite_map: dict[str, Any]
+) -> dict[str, Any]:
+    """Apply a corrected suite/task map to an already-generated metadata manifest."""
+    output = dict(manifest)
+    remapped_entries = []
+    for row in manifest.get("entries", []):
+        mapped = dict(row)
+        source_suite = str(row.get("source_dataset", row["suite"]))
+        source_task_index = int(row.get("source_task_index", row["task_index"]))
+        mapped["suite"], mapped["task_index"] = _mapped_suite_and_task(
+            source_suite, source_task_index, suite_map
+        )
+        remapped_entries.append(mapped)
+    output["entries"] = remapped_entries
+    output["task_mapping_applied"] = True
+    return output
 
 
 def _jsonl(path: Path) -> list[dict[str, Any]]:
@@ -72,15 +164,10 @@ def build_metadata_manifest(
     by_suite: dict[str, list[dict[str, Any]]] = {}
     for row in groups:
         source_suite = str(row["source_dataset"])
-        mapping = (suite_map or {}).get(source_suite, {})
-        if isinstance(mapping, str):
-            mapping = {"suite": mapping}
-        if not isinstance(mapping, dict):
-            raise ValueError(f"suite map entry for {source_suite!r} must be a string or object")
-        rollout_suite = str(mapping.get("suite", source_suite))
-        task_map = mapping.get("task_index_map", {})
         source_task_index = int(row["task_index"])
-        rollout_task_index = int(task_map.get(str(source_task_index), task_map.get(source_task_index, source_task_index)))
+        rollout_suite, rollout_task_index = _mapped_suite_and_task(
+            source_suite, source_task_index, suite_map
+        )
         mapped_row = dict(row)
         mapped_row["_rollout_suite"] = rollout_suite
         mapped_row["_rollout_task_index"] = rollout_task_index
@@ -104,6 +191,7 @@ def build_metadata_manifest(
                         "initial_state_index": int(initial_state_index),
                         "variant_id": variant_id,
                         "instruction": variants[variant_id]["text"],
+                        "canonical_instruction": variants["canonical"]["text"],
                         "positive_instruction": variant_id in POSITIVE_VARIANTS,
                         "language_group_id": row.get("language_group_id"),
                     })
@@ -306,6 +394,9 @@ def main() -> None:
         "--suite-map", default=None,
         help="Optional JSON mapping source_dataset/task indices to LIBERO suite/task indices.",
     )
+    remap = subparsers.add_parser("remap-manifest")
+    remap.add_argument("--manifest", required=True)
+    remap.add_argument("--suite-map", required=True)
     plus = subparsers.add_parser("filter-libero-plus-language")
     plus.add_argument("--tasks-json", required=True)
     select = subparsers.add_parser("select")
@@ -318,7 +409,7 @@ def main() -> None:
     aggregate = subparsers.add_parser("aggregate")
     aggregate.add_argument("--frozen", required=True)
     aggregate.add_argument("results", nargs=4)
-    for command in (manifest, plus, select, merge, extract, aggregate):
+    for command in (manifest, remap, plus, select, merge, extract, aggregate):
         command.add_argument("--output", required=True)
     args = parser.parse_args()
     if args.command == "metadata-manifest":
@@ -333,6 +424,10 @@ def main() -> None:
             args.tasks_per_suite,
             state_indices,
             _load_json(args.suite_map) if args.suite_map else None,
+        )
+    elif args.command == "remap-manifest":
+        output = remap_metadata_manifest(
+            _load_json(args.manifest), _load_json(args.suite_map)
         )
     elif args.command == "filter-libero-plus-language":
         payload = _load_json(args.tasks_json)

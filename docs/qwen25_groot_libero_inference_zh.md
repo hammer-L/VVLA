@@ -159,6 +159,7 @@ python examples/simBenchmarks/LIBERO/eval_files/eval_libero.py \
   --args.host 127.0.0.1 \
   --args.port "$PORT" \
   --args.task-suite-name libero_goal \
+  --args.task-ids 8 \
   --args.max-tasks 1 \
   --args.num-trials-per-task 1 \
   --args.image-views primary,wrist \
@@ -243,17 +244,13 @@ export EXPANDED_DIR="$RESULT_ROOT/expanded_test"
 mkdir -p "$EXPANDED_DIR/videos"
 ```
 
-如果 `language_bank.jsonl` 的 `source_dataset` 是 LeRobot 长名称，创建映射：
+如果 `language_bank.jsonl` 的 `source_dataset` 是 IPEC LeRobot 长名称，必须同时
+映射 suite 和 task ID。LeRobot 的 task 顺序与 LIBERO simulator 不同，不能只改
+suite 名。仓库已经提供完整映射：
 
 ```bash
-cp /dev/stdin "$EXPANDED_DIR/suite_map.json" <<'JSON'
-{
-  "libero_spatial_no_noops_1.0.0_lerobot": {"suite": "libero_spatial"},
-  "libero_object_no_noops_1.0.0_lerobot": {"suite": "libero_object"},
-  "libero_goal_no_noops_1.0.0_lerobot": {"suite": "libero_goal"},
-  "libero_10_no_noops_1.0.0_lerobot": {"suite": "libero_10"}
-}
-JSON
+cp examples/simBenchmarks/LIBERO/eval_files/ipec_lerobot_suite_map.json \
+  "$EXPANDED_DIR/suite_map.json"
 ```
 
 如果 `source_dataset` 已经是 `libero_spatial`、`libero_object`、`libero_goal`、
@@ -295,7 +292,18 @@ PY
 ```
 
 若 metadata 里的 task 编号与原 LIBERO 编号不一致，必须先在 `suite_map.json` 中增加
-`task_index_map`，不要直接运行。
+完整的 `task_index_map`。evaluator 默认会把 manifest 的 canonical 指令与 LIBERO
+环境任务核对；不一致会在 rollout 前报错，不能关闭该检查来掩盖映射问题。
+
+已经生成过错误 manifest 时，可以直接修复，无需重新生成语言 metadata：
+
+```bash
+python examples/simBenchmarks/LIBERO/eval_files/classifier_language_rollout.py \
+  remap-manifest \
+  --manifest "$EXPANDED_DIR/test_manifest.json" \
+  --suite-map "$EXPANDED_DIR/suite_map.json" \
+  --output "$EXPANDED_DIR/test_manifest.corrected.json"
+```
 
 ## 7. 扩充 benchmark 冒烟测试和正式评测
 
@@ -307,6 +315,7 @@ python examples/simBenchmarks/LIBERO/eval_files/eval_libero.py \
   --args.port "$PORT" \
   --args.task-suite-name libero_goal \
   --args.max-tasks 1 \
+  --args.max-episodes-per-task 1 \
   --args.rollout-manifest "$EXPANDED_DIR/test_manifest.json" \
   --args.instruction-variant paraphrase_1 \
   --args.image-views primary,wrist \
@@ -314,6 +323,9 @@ python examples/simBenchmarks/LIBERO/eval_files/eval_libero.py \
   --args.result-json "$EXPANDED_DIR/smoke_paraphrase_1.json" \
   --args.video-out-path "$EXPANDED_DIR/videos/smoke_paraphrase_1"
 ```
+
+这里显式选择 simulator task 8（`put the bowl on the plate`），用于复查之前的错配；
+`--max-episodes-per-task 1` 保证只跑一个 initial state。
 
 正式运行七个语言变体：
 
@@ -358,7 +370,35 @@ python examples/simBenchmarks/LIBERO/eval_files/classifier_language_rollout.py \
 指令的环境目标仍是 canonical 目标，因此其 `success` 不能解释为“错误指令任务成功
 率”；它们只应用于 canonical-goal suppression 和动作轨迹分歧诊断。
 
-## 8. 下一步：验证 classifier 是否提升
+## 8. 在自建 benchmark 上使用发布权重
+
+先判断自建 benchmark 属于哪一类：
+
+1. **只扩充语言**：场景、BDDL goal 和 initial states 都来自原 LIBERO。直接使用本节
+   的 manifest 流程；每条语言组的 `canonical` 必须是对应 LIBERO 环境的原始指令，
+   paraphrase 放在其他 variant 中。
+2. **新增场景、布局或 BDDL goal**：先把任务注册进 LIBERO benchmark，并让
+   `task_suite.get_task()`、`get_task_init_states()` 和环境 success predicate 都可用；
+   仅在 JSON 中增加一句指令不会创建新的仿真任务。
+3. **更换机器人、相机或动作空间**：发布权重不能直接公平评测。必须提供 observation/
+   action adapter，通常还需要在同一数据契约上微调。
+
+发布 Qwen2.5-GR00T 权重的评测输入契约必须保持：两路图像按 primary、wrist 顺序，
+客户端 resize 到 224 × 224，不输入 state，动作为 7 维 LIBERO delta action，并使用
+checkpoint 同目录的 `dataset_statistics.json` 反归一化。先运行一任务一 initial state
+的 smoke，再扩大到完整 test split。
+
+建议保留两份 manifest：
+
+- `smoke_manifest.json`：每任务只含 initial state 0，或运行时设置
+  `--args.max-episodes-per-task 1`；
+- `test_manifest.json`：正式实验固定 0–49，并对所有对比方法复用完全相同的 manifest、
+  seed、checkpoint 和输入设置。
+
+官方权重只作为 zero-shot/base VLA baseline。如果自建任务与训练分布差异明显，低成功率
+不能单独说明语言模块失效；需要同时报告原始 LIBERO 复现结果，区分部署错误与任务 OOD。
+
+## 9. 下一步：验证 classifier 是否提升
 
 先完成上述 `off` baseline，再用 benchmark 的 `train` split 在这个完全相同的
 Qwen2.5-GR00T base checkpoint 上训练 classifier。不要直接把此前基于 Qwen3-VL-4B

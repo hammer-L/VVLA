@@ -76,6 +76,59 @@ class LanguageManifestTest(unittest.TestCase):
         self.assertEqual({row["suite"] for row in manifest["entries"]}, {"libero_goal"})
         self.assertEqual({row["task_index"] for row in manifest["entries"]}, {3})
         self.assertEqual({row["source_task_index"] for row in manifest["entries"]}, {11})
+        self.assertTrue(all(row["canonical_instruction"] == "canonical" for row in manifest["entries"]))
+
+    def test_incomplete_explicit_task_map_is_rejected(self):
+        variants = [
+            {"variant_id": variant, "text": variant}
+            for variant in rollout.POSITIVE_VARIANTS + rollout.NEGATIVE_VARIANTS
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            _write_jsonl(Path(directory) / "language_bank.jsonl", [{
+                "source_dataset": "custom_goal", "task_index": 12, "split": "test",
+                "language_group_id": "group", "variants": variants,
+            }])
+            with self.assertRaisesRegex(ValueError, "lacks source task 12"):
+                rollout.build_metadata_manifest(
+                    directory,
+                    "test",
+                    suite_map={"custom_goal": {
+                        "suite": "libero_goal", "task_index_map": {"11": 3},
+                    }},
+                )
+
+    def test_remap_existing_manifest(self):
+        manifest = {"entries": [{
+            "suite": "wrong", "task_index": 11,
+            "source_dataset": "custom_goal", "source_task_index": 11,
+        }]}
+        remapped = rollout.remap_metadata_manifest(
+            manifest,
+            {"custom_goal": {"suite": "libero_goal", "task_index_map": {"11": 3}}},
+        )
+        self.assertEqual(remapped["entries"][0]["suite"], "libero_goal")
+        self.assertEqual(remapped["entries"][0]["task_index"], 3)
+
+    def test_manifest_alignment_rejects_wrong_simulator_task(self):
+        entries = [{
+            "suite": "libero_goal", "task_index": 0, "variant_id": "canonical",
+            "instruction": "put the bowl on the plate",
+        }]
+        with self.assertRaisesRegex(ValueError, "task mismatch"):
+            rollout.assert_manifest_task_alignment(
+                entries, "libero_goal", 0, "open the middle drawer of the cabinet"
+            )
+
+    def test_manifest_alignment_accepts_paraphrase_rows_with_canonical_field(self):
+        entries = [{
+            "suite": "libero_goal", "task_index": 8, "variant_id": "paraphrase_1",
+            "instruction": "Set the bowl onto the plate",
+            "canonical_instruction": "Put the bowl on the plate.",
+        }]
+        expected = rollout.assert_manifest_task_alignment(
+            entries, "libero_goal", 8, "put the bowl on the plate"
+        )
+        self.assertEqual(expected, "Put the bowl on the plate.")
 
     def test_libero_plus_filter_is_strictly_language(self):
         tasks = [{"id": 1, "category": "Language"}, {"id": 2, "category": "Spatial"}]
