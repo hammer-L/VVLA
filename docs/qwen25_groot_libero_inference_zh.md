@@ -3,9 +3,9 @@
 本文档用于完成两个实验：
 
 1. 用发布的 Qwen2.5 StarVLA-GR00T 权重在四个原始 LIBERO suite 上运行
-   canonical 指令；
+  canonical 指令；
 2. 保持模型、任务和初始状态不变，在语言扩充 benchmark 的 `test` split 上
-   运行 canonical、paraphrase 和错误指令。
+  运行 canonical、paraphrase 和错误指令。
 
 这一步只建立原始 VLA baseline（`classifier_mode=off`），不需要 classifier
 checkpoint。之后要验证 classifier 是否提升成功率，应在相同 rollout 清单上再运行
@@ -94,7 +94,7 @@ LIBERO 及评测依赖：
 cd /home/happigo/vla_ws/starVLA
 
 LIBERO_CONDA_ENV=libero \
-LIBERO_PARENT_DIR=/path/to/install \
+LIBERO_PARENT_DIR=/root/gpufree-data/liumingyu/LIBERO \
 bash examples/simBenchmarks/LIBERO/eval_files/install_libero.sh
 ```
 
@@ -110,10 +110,10 @@ conda run -n libero python -c \
 终端 A 使用能够加载 starVLA 和 GPU 的环境：
 
 ```bash
-cd /home/happigo/vla_ws/starVLA
+cd ~/starVLA
 conda activate starVLA
 
-export BASE_CKPT="$PWD/playground/Pretrained_models/StarVLA/Qwen2.5-VL-GR00T-LIBERO-4in1/checkpoints/steps_30000_pytorch_model.pt"
+export BASE_CKPT="$PWD/playground/Pretrained_models/Qwen2.5-VL-GR00T-LIBERO-4in1/checkpoints/steps_30000_pytorch_model.pt"
 export PORT=10093
 export CUDA_VISIBLE_DEVICES=0
 
@@ -144,10 +144,9 @@ python deployment/model_server/server_policy.py \
 先只跑一个 suite 中的一个任务、一个初始状态。终端 B：
 
 ```bash
-cd /home/happigo/vla_ws/starVLA
+cd ~/starVLA
 conda activate libero
-
-export LIBERO_HOME=/path/to/install/LIBERO
+export LIBERO_HOME=/root/gpufree-data/liumingyu/LIBERO
 export LIBERO_CONFIG_PATH="$LIBERO_HOME/libero"
 export PYTHONPATH="$LIBERO_HOME:$PWD:${PYTHONPATH:-}"
 export MUJOCO_GL=egl
@@ -239,7 +238,7 @@ anchors.jsonl
 设置路径：
 
 ```bash
-export META_DIR=/当前用户可读的/benchmark/meta
+export META_DIR=/root/gpufree-data/liumingyu/datasets/libero/benchmark/meta
 export EXPANDED_DIR="$RESULT_ROOT/expanded_test"
 mkdir -p "$EXPANDED_DIR/videos"
 ```
@@ -374,19 +373,5 @@ Qwen2.5-GR00T base checkpoint 上训练 classifier。不要直接把此前基于
 4. 使用相同 seed，使各模式共享首个初始噪声；
 5. 比较配对成功率差值和推理延迟。
 
-完整的 classifier 训练、val 选参和四模式聚合命令见
-[`classifier_guided_libero_rollout_zh.md`](classifier_guided_libero_rollout_zh.md)。
-
-## 9. 常见错误
-
-- `...Qwen2.5-VL-3B-Instruct is not a local folder`：缺少第 2.1 节的基座模型，或
-  `base_vlm` 路径错误。
-- `ModuleNotFoundError: libero/mujoco/robosuite`：在终端 B 安装或激活 LIBERO
-  环境；服务端环境不要求导入 LIBERO。
-- WebSocket connection refused：服务未启动、端口不一致，或服务初始化仍在加载
-  8.4GB checkpoint。
-- `manifest has no suite/variant entries`：suite 映射或 variant 名称不匹配。
-- task/init-state 越界：metadata ID 不是 LIBERO simulator ID，需要修正
-  `suite_map.json`。
-- 成功率明显低于参考值：首先核对两路图像顺序、无 state、224 × 224、checkpoint
-  自带统计、50 个 initial states，以及是否意外改了 flow-matching steps。
+完整的 classifier 训练、val 选参和四模式聚合命令见  
+`[classifier_guided_libero_rollout_zh.md](classifier_guided_libero_rollout_zh.md)`。
