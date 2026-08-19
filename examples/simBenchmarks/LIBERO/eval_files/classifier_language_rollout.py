@@ -202,6 +202,7 @@ def build_metadata_manifest(
         "seed": seed,
         "tasks_per_suite": tasks_per_suite,
         "initial_state_indices": list(initial_state_indices),
+        "task_mapping_applied": suite_map is not None,
         "entries": entries,
     }
 

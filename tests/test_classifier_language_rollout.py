@@ -40,6 +40,7 @@ class LanguageManifestTest(unittest.TestCase):
         self.assertTrue(all(row["initial_state_index"] == 0 for row in val["entries"]))
         self.assertEqual(test["split"], "test")
         self.assertEqual(test["tasks_per_suite"], -1)
+        self.assertFalse(test["task_mapping_applied"])
         self.assertEqual({row["task_index"] for row in test["entries"]}, set(range(4)))
         self.assertTrue(all(row["variant_id"] in rollout.POSITIVE_VARIANTS + rollout.NEGATIVE_VARIANTS for row in test["entries"]))
 
@@ -76,6 +77,7 @@ class LanguageManifestTest(unittest.TestCase):
         self.assertEqual({row["suite"] for row in manifest["entries"]}, {"libero_goal"})
         self.assertEqual({row["task_index"] for row in manifest["entries"]}, {3})
         self.assertEqual({row["source_task_index"] for row in manifest["entries"]}, {11})
+        self.assertTrue(manifest["task_mapping_applied"])
         self.assertTrue(all(row["canonical_instruction"] == "canonical" for row in manifest["entries"]))
 
     def test_incomplete_explicit_task_map_is_rejected(self):

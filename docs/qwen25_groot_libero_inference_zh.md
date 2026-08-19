@@ -270,6 +270,8 @@ python examples/simBenchmarks/LIBERO/eval_files/classifier_language_rollout.py \
   --initial-state-indices "$INITIAL_STATES" \
   --suite-map "$EXPANDED_DIR/suite_map.json" \
   --output "$EXPANDED_DIR/test_manifest.json"
+
+export TEST_MANIFEST="$EXPANDED_DIR/test_manifest.json"
 ```
 
 生成后先检查映射范围。四个标准 suite 的 `task_index` 应在 0–9，initial state 应在
@@ -303,6 +305,9 @@ python examples/simBenchmarks/LIBERO/eval_files/classifier_language_rollout.py \
   --manifest "$EXPANDED_DIR/test_manifest.json" \
   --suite-map "$EXPANDED_DIR/suite_map.json" \
   --output "$EXPANDED_DIR/test_manifest.corrected.json"
+
+# 后续评测必须改用修正后的文件；不要再传入旧的 test_manifest.json。
+export TEST_MANIFEST="$EXPANDED_DIR/test_manifest.corrected.json"
 ```
 
 ## 7. 扩充 benchmark 冒烟测试和正式评测
@@ -314,9 +319,10 @@ python examples/simBenchmarks/LIBERO/eval_files/eval_libero.py \
   --args.host 127.0.0.1 \
   --args.port "$PORT" \
   --args.task-suite-name libero_goal \
+  --args.task-ids 8 \
   --args.max-tasks 1 \
   --args.max-episodes-per-task 1 \
-  --args.rollout-manifest "$EXPANDED_DIR/test_manifest.json" \
+  --args.rollout-manifest "$TEST_MANIFEST" \
   --args.instruction-variant paraphrase_1 \
   --args.image-views primary,wrist \
   --args.rollout-phase metadata_test \
@@ -348,7 +354,7 @@ for VARIANT in "${VARIANTS[@]}"; do
       --args.task-suite-name "$SUITE" \
       --args.max-tasks -1 \
       --args.seed 42 \
-      --args.rollout-manifest "$EXPANDED_DIR/test_manifest.json" \
+      --args.rollout-manifest "$TEST_MANIFEST" \
       --args.instruction-variant "$VARIANT" \
       --args.image-views primary,wrist \
       --args.rollout-phase metadata_test \
